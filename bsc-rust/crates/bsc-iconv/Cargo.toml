@@ -1,0 +1,22 @@
+[package]
+name = "bsc-iconv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CSyntax to ISyntax conversion (mirrors IConv.hs)"
+
+[dependencies]
+bsc-diagnostics.workspace = true
+bsc-syntax.workspace = true
+bsc-types.workspace = true
+bsc-symtab.workspace = true
+thiserror.workspace = true
+rustc-hash.workspace = true
+num-bigint.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+
+[lints]
+workspace = true

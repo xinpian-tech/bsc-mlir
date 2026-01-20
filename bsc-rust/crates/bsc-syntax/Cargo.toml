@@ -1,0 +1,21 @@
+[package]
+name = "bsc-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Core AST types (CSyntax, ISyntax) for BSC Rust frontend"
+
+[dependencies]
+bsc-diagnostics.workspace = true
+smol_str.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "smol_str/serde", "bsc-diagnostics/serde"]
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "bsc-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hand-written lexer for BSC (mirrors Lex.hs)"
+
+[dependencies]
+bsc-diagnostics.workspace = true
+bsc-syntax.workspace = true
+smol_str.workspace = true
+logos.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "bsc-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Type system (Type, Kind, Substitution, Unification) for BSC"
+
+[dependencies]
+bsc-diagnostics.workspace = true
+bsc-syntax.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
+smol_str.workspace = true
+miette.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+
+[lints]
+workspace = true

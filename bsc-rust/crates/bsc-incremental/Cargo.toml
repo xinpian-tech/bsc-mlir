@@ -1,0 +1,19 @@
+[package]
+name = "bsc-incremental"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Incremental computation database using Salsa for BSC Rust frontend"
+
+[dependencies]
+bsc-diagnostics.workspace = true
+bsc-lexer.workspace = true
+bsc-syntax.workspace = true
+salsa.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "bsc-parser-treesitter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tree-sitter based error-tolerant parser for IDE features"
+
+[dependencies]
+bsc-diagnostics.workspace = true
+bsc-syntax.workspace = true
+# tree-sitter = "0.22"  # Commented until grammar is ready
+
+[lints]
+workspace = true

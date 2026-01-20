@@ -1,0 +1,16 @@
+[package]
+name = "bsc-symtab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Symbol table for BSC (mirrors SymTab.hs)"
+
+[dependencies]
+bsc-diagnostics.workspace = true
+bsc-syntax.workspace = true
+bsc-types.workspace = true
+rustc-hash.workspace = true
+
+[lints]
+workspace = true

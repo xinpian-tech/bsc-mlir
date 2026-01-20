@@ -1,0 +1,29 @@
+[package]
+name = "bsc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CLI frontend for BSC Rust compiler"
+
+[[bin]]
+name = "bsc-rust"
+path = "src/main.rs"
+
+[dependencies]
+bsc-diagnostics.workspace = true
+bsc-export.workspace = true
+bsc-incremental.workspace = true
+bsc-lexer.workspace = true
+bsc-lsp.workspace = true
+bsc-parser-bsv.workspace = true
+bsc-parser-classic.workspace = true
+bsc-syntax.workspace = true
+bsc-typecheck.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+
+[lints]
+workspace = true

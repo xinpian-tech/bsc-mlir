@@ -1,0 +1,94 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bsc-syntax",
+    "crates/bsc-lexer",
+    "crates/bsc-parser-classic",
+    "crates/bsc-parser-bsv",
+    "crates/bsc-parser-treesitter",
+    "crates/bsc-types",
+    "crates/bsc-typecheck",
+    "crates/bsc-symtab",
+    "crates/bsc-iconv",
+    "crates/bsc-diagnostics",
+    "crates/bsc-incremental",
+    "crates/bsc-stdlib",
+    "crates/bsc-export",
+    "crates/bsc-lsp",
+    "crates/bsc-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/bsc-rust"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Workspace crates
+bsc-syntax = { path = "crates/bsc-syntax" }
+bsc-lexer = { path = "crates/bsc-lexer" }
+bsc-parser-classic = { path = "crates/bsc-parser-classic" }
+bsc-parser-bsv = { path = "crates/bsc-parser-bsv" }
+bsc-parser-treesitter = { path = "crates/bsc-parser-treesitter" }
+bsc-types = { path = "crates/bsc-types" }
+bsc-typecheck = { path = "crates/bsc-typecheck" }
+bsc-symtab = { path = "crates/bsc-symtab" }
+bsc-iconv = { path = "crates/bsc-iconv" }
+bsc-diagnostics = { path = "crates/bsc-diagnostics" }
+bsc-incremental = { path = "crates/bsc-incremental" }
+bsc-stdlib = { path = "crates/bsc-stdlib" }
+bsc-export = { path = "crates/bsc-export" }
+bsc-lsp = { path = "crates/bsc-lsp" }
+bsc-cli = { path = "crates/bsc-cli" }
+
+# Incremental computation
+salsa = "0.18"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "2.0"
+miette = { version = "7.0", features = ["fancy"] }
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# LSP
+tower-lsp = "0.20"
+tokio = { version = "1.0", features = ["full"] }
+
+# Arbitrary precision integers (for Haskell Integer compatibility)
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+
+# Utilities
+smol_str = "0.3"
+rustc-hash = "2.0"
+indexmap = "2.0"
+bumpalo = "3.0"
+logos = "0.15"
+
+# Parser combinator library
+chumsky = "0.12"
+ariadne = "0.5"
+
+# Testing
+pretty_assertions = "1.0"
+insta = { version = "1.0", features = ["json"] }
+proptest = "1.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

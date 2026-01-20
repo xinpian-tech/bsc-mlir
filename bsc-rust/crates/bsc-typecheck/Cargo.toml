@@ -1,0 +1,20 @@
+[package]
+name = "bsc-typecheck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Type checking for BSC (mirrors TCheck.hs, TIMonad.hs)"
+
+[dependencies]
+bsc-diagnostics.workspace = true
+bsc-syntax.workspace = true
+bsc-types.workspace = true
+bsc-symtab.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+
+[lints]
+workspace = true

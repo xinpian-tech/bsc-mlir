@@ -1,0 +1,16 @@
+[package]
+name = "bsc-stdlib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Standard library loader for BSC Rust frontend"
+
+[dependencies]
+bsc-syntax.workspace = true
+bsc-symtab.workspace = true
+bsc-parser-classic.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

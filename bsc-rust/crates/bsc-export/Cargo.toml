@@ -1,0 +1,19 @@
+[package]
+name = "bsc-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "JSON export for ISyntax (for backend consumption)"
+
+[dependencies]
+bsc-syntax = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+num-bigint.workspace = true
+
+[lints]
+workspace = true

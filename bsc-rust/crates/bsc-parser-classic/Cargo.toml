@@ -1,0 +1,27 @@
+[package]
+name = "bsc-parser-classic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Parser for Classic Bluespec syntax (mirrors CParser.hs)"
+
+[dependencies]
+bsc-diagnostics.workspace = true
+bsc-syntax.workspace = true
+bsc-lexer.workspace = true
+chumsky.workspace = true
+ariadne.workspace = true
+smol_str.workspace = true
+num-bigint.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+walkdir = "2"
+
+[[bin]]
+name = "bsc-show-csyntax"
+path = "src/bin/show_csyntax.rs"
+
+[lints]
+workspace = true
