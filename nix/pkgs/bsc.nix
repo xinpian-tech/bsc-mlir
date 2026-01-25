@@ -41,12 +41,22 @@ let
     url = "https://github.com/B-Lang-org/bsc/releases/download/2024.07/yices-src-for-bsc-2024.07.tar.gz";
     sha256 = "sha256-pyEdCJvmgwOYPMZEtw7aro76tSn/Y/2GcKTyARmIh4E=";
   };
+
+  filteredSrc = lib.cleanSourceWith {
+    src = ../..;
+    filter = path: type:
+      let
+        relPath = lib.removePrefix (toString ../.. + "/") (toString path);
+        isRustDir = lib.hasPrefix "bsc-rust" relPath;
+      in
+        !isRustDir;
+  };
 in
 stdenv.mkDerivation {
-  pname = "bsc-frontend";
+  pname = "bsc-original";
   inherit version;
 
-  src = ../..;
+  src = filteredSrc;
 
   enableParallelBuilding = true;
 

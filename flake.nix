@@ -57,7 +57,6 @@
           version = self.shortRev or self.dirtyShortRev or "dirty";
           src = ./bsc-rust;
           cargoLock.lockFile = ./bsc-rust/Cargo.lock;
-          # Skip tests for now during initial development
           doCheck = false;
         };
 

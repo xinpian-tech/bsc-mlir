@@ -1,22 +1,20 @@
 [package]
-name = "bsc-parser-bsv"
+name = "bsc-lexer-bsv"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "BSV (SystemVerilog-like) syntax parser for BSC Rust frontend"
+description = "Lexer for BSV (SystemVerilog-like) syntax (mirrors SystemVerilogScanner.lhs)"
 
 [dependencies]
 bsc-diagnostics.workspace = true
 bsc-syntax.workspace = true
-bsc-lexer-bsv.workspace = true
-chumsky.workspace = true
-smol_str.workspace = true
 num-bigint.workspace = true
+num-traits.workspace = true
+smol_str.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
-bsc-test-utils.workspace = true
 
 [lints]
 workspace = true

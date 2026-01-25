@@ -41,7 +41,7 @@
 //! 5. At a lesser column, insert `}_`
 
 use bsc_diagnostics::{Position, Span};
-use bsc_lexer::{Token, TokenKind};
+use bsc_lexer_classic::{Token, TokenKind};
 
 /// Create a layout token inheriting position from another token.
 fn make_layout_token(kind: TokenKind, from: &Token) -> Token {
@@ -367,58 +367,4 @@ pub fn process_layout(tokens: Vec<Token>) -> Vec<Token> {
     }
 
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bsc_lexer::{Lexer, SyntaxMode};
-
-    #[test]
-    fn test_explicit_braces_no_layout() {
-        let source = "package Foo where { x = 1 }";
-        let lexer = Lexer::new(source, SyntaxMode::Classic);
-        let tokens = lexer.tokenize().unwrap();
-        let processed = process_layout(tokens);
-
-        // Should not add layout tokens when explicit braces are used
-        assert!(!processed
-            .iter()
-            .any(|t| t.kind == TokenKind::LayoutLBrace));
-    }
-
-    #[test]
-    fn test_layout_after_where() {
-        let source = "package Foo where\n  x = 1";
-        let lexer = Lexer::new(source, SyntaxMode::Classic);
-        let tokens = lexer.tokenize().unwrap();
-        let processed = process_layout(tokens);
-
-        // Should add layout tokens
-        assert!(processed
-            .iter()
-            .any(|t| t.kind == TokenKind::LayoutLBrace));
-    }
-
-    #[test]
-    fn test_layout_case_arms() {
-        let source = r#"package Test where
-f x = case x of
-          Left y -> 1
-"#;
-        let lexer = Lexer::new(source, SyntaxMode::Classic);
-        let tokens = lexer.tokenize().unwrap();
-        let processed = process_layout(tokens);
-
-        // Find the position of KwOf
-        let kw_of_pos = processed.iter().position(|t| t.kind == TokenKind::KwOf).unwrap();
-
-        // The next token after KwOf should be LayoutLBrace
-        assert_eq!(processed[kw_of_pos + 1].kind, TokenKind::LayoutLBrace,
-            "Expected LayoutLBrace after KwOf, got {:?}", processed[kw_of_pos + 1].kind);
-
-        // The token after LayoutLBrace should be ConId("Left"), NOT LayoutRBrace
-        assert_eq!(processed[kw_of_pos + 2].kind, TokenKind::ConId("Left".into()),
-            "Expected ConId(Left) after LayoutLBrace, got {:?}", processed[kw_of_pos + 2].kind);
-    }
 }

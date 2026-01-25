@@ -1,0 +1,8 @@
+[package]
+name = "bsc-preprocess"
+version = "0.1.0"
+edition = "2024"
+description = "SystemVerilog-style preprocessor for BSC Rust frontend"
+
+[dependencies]
+thiserror = "2.0"

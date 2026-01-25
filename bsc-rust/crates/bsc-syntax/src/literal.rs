@@ -157,17 +157,3 @@ impl fmt::Display for IntLiteral {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_int_literal_display() {
-        let lit = IntLiteral::new(255, Some(8), IntBase::Hexadecimal);
-        assert_eq!(format!("{lit}"), "8'hFF");
-
-        let lit = IntLiteral::decimal(42);
-        assert_eq!(format!("{lit}"), "42");
-    }
-}

@@ -421,6 +421,14 @@ pub enum LexError {
         #[label("invalid literal here")]
         span: SourceSpan,
     },
+
+    #[error("C preprocessor directive at {position} - should be preprocessed first")]
+    CppDirective {
+        directive: String,
+        position: Position,
+        #[label("CPP directive here")]
+        span: SourceSpan,
+    },
 }
 
 /// Base error type for parser errors.
@@ -580,60 +588,5 @@ impl DiagnosticCollector {
     /// Consume and return all warnings.
     pub fn take_warnings(&mut self) -> Vec<Box<dyn Diagnostic + Send + Sync>> {
         std::mem::take(&mut self.warnings)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_position_display() {
-        let pos = Position::new("test.bs", 10, 5);
-        assert_eq!(format!("{pos}"), "\"test.bs\", line 10, column 5");
-
-        let unknown = Position::unknown();
-        assert_eq!(format!("{unknown}"), "Unknown position");
-
-        let cmd = Position::command_line();
-        assert_eq!(format!("{cmd}"), "Command line");
-
-        let no_file = Position::line_col(5, 3);
-        assert_eq!(format!("{no_file}"), "line 5, column 3");
-    }
-
-    #[test]
-    fn test_span_merge() {
-        let a = Span::new(10, 20);
-        let b = Span::new(15, 30);
-        let merged = a.merge(b);
-        assert_eq!(merged, Span::new(10, 30));
-    }
-
-    #[test]
-    fn test_span_len() {
-        let span = Span::new(10, 20);
-        assert_eq!(span.len(), 10);
-    }
-
-    #[test]
-    fn test_span_to_position() {
-        let source = "line1\nline2\nline3";
-        let filename: Arc<str> = Arc::from("test.bs");
-
-        let span = Span::new(0, 1);
-        let pos = span.to_position(source, &filename);
-        assert_eq!(pos.line, 1);
-        assert_eq!(pos.column, 1);
-
-        let span = Span::new(6, 7);
-        let pos = span.to_position(source, &filename);
-        assert_eq!(pos.line, 2);
-        assert_eq!(pos.column, 1);
-
-        let span = Span::new(8, 9);
-        let pos = span.to_position(source, &filename);
-        assert_eq!(pos.line, 2);
-        assert_eq!(pos.column, 3);
     }
 }

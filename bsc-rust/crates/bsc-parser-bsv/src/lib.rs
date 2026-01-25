@@ -15,8 +15,16 @@
 //! - **No panics**: The parser never panics on invalid input; it returns
 //!   structured error information instead.
 
+pub mod definitions;
+pub mod expressions;
+pub mod imperative;
+pub mod operators;
+pub mod package;
+pub mod patterns;
+pub mod types;
+
 use bsc_diagnostics::{ParseError, Span};
-use bsc_lexer::{Lexer, SyntaxMode, Token, TokenKind};
+use bsc_lexer_bsv::{Lexer, Token, TokenKind};
 use bsc_syntax::{CDefn, CExpr, CPackage, CPat, CType};
 
 /// Result type for parser operations.
@@ -55,7 +63,7 @@ impl<'src> BsvParser<'src> {
     /// Returns an error if lexing fails (e.g., unterminated string,
     /// invalid character).
     pub fn new(source: &'src str) -> ParseResult<Self> {
-        let lexer = Lexer::new(source, SyntaxMode::Bsv);
+        let lexer = Lexer::new(source);
         let tokens = lexer.tokenize().map_err(|e| ParseError::InvalidSyntax {
             message: format!("Lexer error: {e}"),
             span: Span::DUMMY.into(),
@@ -83,12 +91,37 @@ impl<'src> BsvParser<'src> {
     ///
     /// Returns an error if the source does not contain a valid package.
     pub fn parse_package(&mut self) -> ParseResult<CPackage> {
-        // TODO: Implement full package parsing
-        // For now, return a placeholder error indicating this is a skeleton
-        Err(ParseError::InvalidSyntax {
-            message: "BSV package parsing not yet implemented".to_string(),
-            span: self.current_span().into(),
-        })
+        self.parse_package_with_default("DefaultPackage".to_string())
+    }
+
+    /// Parse a BSV package with a default name.
+    pub fn parse_package_with_default(&mut self, default_name: String) -> ParseResult<CPackage> {
+        // Convert tokens to the format expected by the chumsky parser
+        let token_spans: Vec<(bsc_lexer_bsv::TokenKind, chumsky::prelude::SimpleSpan<u32>)> =
+            self.tokens
+                .iter()
+                .map(|token| {
+                    use chumsky::span::Span as ChumskySpan;
+                    let span = chumsky::prelude::SimpleSpan::new((), token.span.start..token.span.end);
+                    (token.kind.clone(), span)
+                })
+                .collect();
+
+        // Use the chumsky-based package parser
+        package::parse_bsv_package(token_spans, default_name)
+            .map_err(|errors| {
+                // Convert chumsky errors to our ParseError format
+                let message = if errors.is_empty() {
+                    "Unknown parse error".to_string()
+                } else {
+                    format!("Parse error: {:?}", errors[0])
+                };
+
+                ParseError::InvalidSyntax {
+                    message,
+                    span: Span::DUMMY.into(),
+                }
+            })
     }
 
     /// Parse a top-level definition.
@@ -104,11 +137,52 @@ impl<'src> BsvParser<'src> {
     ///
     /// Returns an error if the current tokens do not form a valid definition.
     pub fn parse_definition(&mut self) -> ParseResult<CDefn> {
-        // TODO: Implement definition parsing
-        Err(ParseError::InvalidSyntax {
-            message: "BSV definition parsing not yet implemented".to_string(),
-            span: self.current_span().into(),
-        })
+        match self.current_kind() {
+            TokenKind::KwModule => {
+                let _stmt = self.parse_module()?;
+                // TODO: Convert ImperativeStatement to CDefn
+                Err(ParseError::InvalidSyntax {
+                    message: "Module definition conversion to CDefn not yet implemented".to_string(),
+                    span: self.current_span().into(),
+                })
+            }
+            TokenKind::KwFunction => {
+                let _stmt = self.parse_function()?;
+                // TODO: Convert ImperativeStatement to CDefn
+                Err(ParseError::InvalidSyntax {
+                    message: "Function definition conversion to CDefn not yet implemented".to_string(),
+                    span: self.current_span().into(),
+                })
+            }
+            TokenKind::KwInterface => {
+                let _stmt = self.parse_interface_decl()?;
+                // TODO: Convert ImperativeStatement to CDefn
+                Err(ParseError::InvalidSyntax {
+                    message: "Interface definition conversion to CDefn not yet implemented".to_string(),
+                    span: self.current_span().into(),
+                })
+            }
+            TokenKind::KwTypedef => {
+                let _stmt = self.parse_typedef()?;
+                // TODO: Convert ImperativeStatement to CDefn
+                Err(ParseError::InvalidSyntax {
+                    message: "Typedef definition conversion to CDefn not yet implemented".to_string(),
+                    span: self.current_span().into(),
+                })
+            }
+            TokenKind::KwRule => {
+                let _stmt = self.parse_rule()?;
+                // TODO: Convert ImperativeStatement to CDefn
+                Err(ParseError::InvalidSyntax {
+                    message: "Rule definition conversion to CDefn not yet implemented".to_string(),
+                    span: self.current_span().into(),
+                })
+            }
+            _ => Err(ParseError::InvalidSyntax {
+                message: format!("Expected definition keyword, found: {}", self.current_kind().name()),
+                span: self.current_span().into(),
+            }),
+        }
     }
 
     /// Parse an expression.
@@ -117,11 +191,8 @@ impl<'src> BsvParser<'src> {
     ///
     /// Returns an error if the current tokens do not form a valid expression.
     pub fn parse_expression(&mut self) -> ParseResult<CExpr> {
-        // TODO: Implement expression parsing
-        Err(ParseError::InvalidSyntax {
-            message: "BSV expression parsing not yet implemented".to_string(),
-            span: self.current_span().into(),
-        })
+        // Delegate to the expressions module implementation
+        self.parse_expr()
     }
 
     /// Parse a pattern.
@@ -130,11 +201,7 @@ impl<'src> BsvParser<'src> {
     ///
     /// Returns an error if the current tokens do not form a valid pattern.
     pub fn parse_pattern(&mut self) -> ParseResult<CPat> {
-        // TODO: Implement pattern parsing
-        Err(ParseError::InvalidSyntax {
-            message: "BSV pattern parsing not yet implemented".to_string(),
-            span: self.current_span().into(),
-        })
+        patterns::parse_pattern(self)
     }
 
     /// Parse a type.
@@ -143,11 +210,8 @@ impl<'src> BsvParser<'src> {
     ///
     /// Returns an error if the current tokens do not form a valid type.
     pub fn parse_type(&mut self) -> ParseResult<CType> {
-        // TODO: Implement type parsing
-        Err(ParseError::InvalidSyntax {
-            message: "BSV type parsing not yet implemented".to_string(),
-            span: self.current_span().into(),
-        })
+        // Delegate to the types module implementation
+        self.parse_type_expr()
     }
 
     // ========================================================================
@@ -231,7 +295,7 @@ impl<'src> BsvParser<'src> {
     fn expect_end_keyword(&mut self, construct: &str) -> ParseResult<Span> {
         let end_keyword = format!("end{construct}");
         match self.current_kind() {
-            TokenKind::VarId(id) if id.as_str() == end_keyword => {
+            TokenKind::Id(id) if id.as_str() == end_keyword => {
                 let span = self.current_span();
                 self.advance();
                 Ok(span)
@@ -273,29 +337,50 @@ pub fn parse(source: &str) -> ParseResult<CPackage> {
     parser.parse_package()
 }
 
+/// Parse BSV source code with a specific default package name.
+pub fn parse_with_default_name(source: &str, default_name: String) -> ParseResult<CPackage> {
+    let mut parser = BsvParser::new(source)?;
+    parser.parse_package_with_default(default_name)
+}
+
+#[derive(Debug)]
+pub struct ParseErrorInfo {
+    pub message: String,
+}
+
+pub fn parse_package_with_file(source: &str, _filename: &str) -> Result<CPackage, Vec<ParseErrorInfo>> {
+    parse(source).map_err(|e| vec![ParseErrorInfo { message: e.to_string() }])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bsc_test_utils::{get_bsc_path, get_testsuite_dir, run_differential_test_fail_fast, SyntaxMode};
 
     #[test]
-    fn test_parser_creation() {
-        let source = "package Test; endpackage";
-        let result = BsvParser::new(source);
-        assert!(result.is_ok());
-    }
+    fn test_differential_bsv_testsuite() {
+        let bsc_path = match get_bsc_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("BSC_PATH not set, skipping differential test");
+                return;
+            }
+        };
 
-    #[test]
-    fn test_parser_skeleton_error() {
-        let source = "package Test; endpackage";
-        let result = parse(source);
-        // Currently returns "not yet implemented" error
-        assert!(result.is_err());
-    }
+        let testsuite_dir = get_testsuite_dir();
+        if !testsuite_dir.exists() {
+            eprintln!("BSC_TESTSUITE_DIR not found at {}, skipping differential test", testsuite_dir.display());
+            return;
+        }
 
-    #[test]
-    fn test_empty_source() {
-        let source = "";
-        let result = BsvParser::new(source);
-        assert!(result.is_ok());
+        run_differential_test_fail_fast(
+            SyntaxMode::Bsv,
+            &testsuite_dir,
+            &bsc_path,
+            |source, filename| {
+                parse_package_with_file(source, filename)
+                    .map_err(|errs| format!("{:?}", errs.first()))
+            },
+        );
     }
 }

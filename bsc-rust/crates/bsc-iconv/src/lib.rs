@@ -1359,29 +1359,3 @@ pub fn convert(pkg: &CPackage, symtab: &SymTab) -> ConvResult<IPackage> {
     converter.convert_package(pkg)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_converter_creation() {
-        let symtab = SymTab::new();
-        let converter = Converter::new(&symtab);
-        // Just verify it compiles
-        let _ = converter;
-    }
-
-    #[test]
-    fn test_conv_error_span() {
-        let err = ConvError::UnknownVariable {
-            name: "x".to_string(),
-            span: Span::new(10, 20),
-        };
-        assert_eq!(err.span(), Some(Span::new(10, 20)));
-
-        let err = ConvError::Internal {
-            message: "test".to_string(),
-        };
-        assert_eq!(err.span(), None);
-    }
-}

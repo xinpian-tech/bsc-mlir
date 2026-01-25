@@ -1,0 +1,11 @@
+[package]
+name = "bsc-test-utils"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+walkdir = "2"
+rayon = "1.10"
+rand = "0.8"
+bsc-syntax = { path = "../bsc-syntax" }
+bsc-preprocess = { path = "../bsc-preprocess" }

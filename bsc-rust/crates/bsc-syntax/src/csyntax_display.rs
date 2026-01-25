@@ -1259,6 +1259,10 @@ impl Display for CType {
             CType::Infix(l, op, r, _) => {
                 write!(f, "TAp (TAp (TCon (TyCon {{tcon_name = {}, tcon_kind = Nothing, tcon_sort = TIabstract}})) ({})) ({})", op, l, r)
             }
+            CType::DefMonad(pos) => {
+                write!(f, "TDefMonad ")?;
+                fmt_position(f, pos)
+            }
         }
     }
 }

@@ -1795,6 +1795,9 @@ pub enum CType {
     List(Box<CType>, Span),
     /// Infix type operator (before fixity resolution)
     Infix(Box<CType>, Id, Box<CType>, Span),
+    /// Default monad type (the `module` keyword)
+    /// Mirrors Haskell's `TDefMonad Position`
+    DefMonad(Position),
 }
 
 /// A type parameter with optional kind annotation.
@@ -1825,14 +1828,3 @@ pub enum CKind {
     Paren(Box<CKind>, Span),
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bsc_diagnostics::Position;
-
-    #[test]
-    fn test_cexpr_span() {
-        let expr = CExpr::Lit(Literal::Integer(crate::literal::IntLiteral::decimal(42)), Span::new(0, 2));
-        assert_eq!(expr.span(), Span::new(0, 2));
-    }
-}

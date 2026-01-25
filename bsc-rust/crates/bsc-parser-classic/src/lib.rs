@@ -16,7 +16,7 @@
 mod layout;
 
 use bsc_diagnostics::{Position, Span};
-use bsc_lexer::{Lexer, LexerFlags, SyntaxMode, Token, TokenKind};
+use bsc_lexer_classic::{Lexer, LexerFlags, Token, TokenKind};
 use bsc_syntax::csyntax::*;
 use bsc_syntax::id::{Id, IdProp};
 use bsc_syntax::literal::{IntBase, IntLiteral, Literal, OrderedFloat};
@@ -433,7 +433,9 @@ token_parser!(rbracket, RBracket, "]");
 token_parser!(semi, Semi, ";");
 token_parser!(comma, Comma, ",");
 token_parser!(dot, Dot, ".");
-token_parser!(dotdot, DotDot, "..");
+fn dotdot<'a>() -> impl Parser<'a, TokenStream<'a>, (), ParserExtra<'a>> + Clone {
+    dot().then(dot()).to(()).labelled("..")
+}
 token_parser!(dcolon, ColonColon, "::");
 token_parser!(colon, Colon, ":");
 token_parser!(equals, Equals, "=");
@@ -485,8 +487,31 @@ fn underscore_pos<'a>() -> impl Parser<'a, TokenStream<'a>, Position, ParserExtr
         .labelled("_")
 }
 
-token_parser!(hash, Hash, "#");
-token_parser!(question, Question, "?");
+fn hash<'a>() -> impl Parser<'a, TokenStream<'a>, (), ParserExtra<'a>> + Clone {
+    any()
+        .try_map(|t: Token, span| {
+            if let TokenKind::VarSym(s) = &t.kind {
+                if s == "#" {
+                    return Ok(());
+                }
+            }
+            Err(Rich::custom(span, "expected #"))
+        })
+        .labelled("#")
+}
+
+fn question<'a>() -> impl Parser<'a, TokenStream<'a>, (), ParserExtra<'a>> + Clone {
+    any()
+        .try_map(|t: Token, span| {
+            if let TokenKind::VarSym(s) = &t.kind {
+                if s == "?" {
+                    return Ok(());
+                }
+            }
+            Err(Rich::custom(span, "expected ?"))
+        })
+        .labelled("?")
+}
 token_parser!(lpragma, LPragma, "{-#");
 token_parser!(rpragma, RPragma, "#-}");
 token_parser!(backtick, Backtick, "`");
@@ -728,7 +753,18 @@ fn p_kind<'a>() -> impl Parser<'a, TokenStream<'a>, CKind, ParserExtra<'a>> + Cl
                 }
             });
 
-        let num = hash().map(|span| CKind::Num(span));
+        let num = any()
+            .try_map(|t: Token, span: SimpleSpan<u32>| {
+                if let TokenKind::VarSym(s) = t.kind {
+                    if s == "#" {
+                        Ok(CKind::Num(Span::new(span.start, span.end)))
+                    } else {
+                        Err(Rich::custom(span, "expected #"))
+                    }
+                } else {
+                    Err(Rich::custom(span, "expected #"))
+                }
+            });
 
         // $ for string kind
         let str_kind = any()
@@ -3499,7 +3535,7 @@ pub fn parse_package(source: &str) -> ParseResult<CPackage> {
 
 /// Parse a source string into a package, with filename for positions.
 pub fn parse_package_with_file(source: &str, filename: &str) -> ParseResult<CPackage> {
-    let lexer = Lexer::with_file(source, SyntaxMode::Classic, LexerFlags::default(), filename);
+    let lexer = Lexer::with_file(source, LexerFlags::default(), filename);
     let raw_tokens = lexer.tokenize().map_err(|e| {
         vec![ParseError {
             message: e.to_string(),
@@ -3530,7 +3566,7 @@ pub fn parse_package_with_file(source: &str, filename: &str) -> ParseResult<CPac
 
 /// Parse a source string into definitions (for testing).
 pub fn parse_definitions(source: &str) -> ParseResult<Vec<CDefn>> {
-    let lexer = Lexer::new(source, SyntaxMode::Classic);
+    let lexer = Lexer::new(source);
     let raw_tokens = lexer.tokenize().map_err(|e| {
         vec![ParseError {
             message: e.to_string(),
@@ -3563,7 +3599,7 @@ pub fn parse_definitions(source: &str) -> ParseResult<Vec<CDefn>> {
 
 /// Parse a source string into a type.
 pub fn parse_type(source: &str) -> ParseResult<CType> {
-    let lexer = Lexer::new(source, SyntaxMode::Classic);
+    let lexer = Lexer::new(source);
     let tokens = lexer.tokenize().map_err(|e| {
         vec![ParseError {
             message: e.to_string(),
@@ -3592,7 +3628,7 @@ pub fn parse_type(source: &str) -> ParseResult<CType> {
 
 /// Parse a source string into an expression.
 pub fn parse_expr(source: &str) -> ParseResult<CExpr> {
-    let lexer = Lexer::new(source, SyntaxMode::Classic);
+    let lexer = Lexer::new(source);
     let tokens = lexer.tokenize().map_err(|e| {
         vec![ParseError {
             message: e.to_string(),
@@ -3621,7 +3657,7 @@ pub fn parse_expr(source: &str) -> ParseResult<CExpr> {
 
 /// Parse a source string into a pattern.
 pub fn parse_pattern(source: &str) -> ParseResult<CPat> {
-    let lexer = Lexer::new(source, SyntaxMode::Classic);
+    let lexer = Lexer::new(source);
     let tokens = lexer.tokenize().map_err(|e| {
         vec![ParseError {
             message: e.to_string(),
@@ -3651,125 +3687,34 @@ pub fn parse_pattern(source: &str) -> ParseResult<CPat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bsc_test_utils::{get_bsc_path, get_libraries_dir, run_differential_test_fail_fast, SyntaxMode};
 
     #[test]
     fn test_differential_all_libraries() {
-        std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
-            .spawn(test_differential_all_libraries_impl)
-            .expect("Failed to spawn test thread")
-            .join()
-            .expect("Test thread panicked");
-    }
-
-    fn test_differential_all_libraries_impl() {
-        use std::path::PathBuf;
-        use std::process::Command;
-
-        let bsc_path = match std::env::var("BSC_PATH") {
-            Ok(p) => p,
-            Err(_) => {
+        let bsc_path = match get_bsc_path() {
+            Some(p) => p,
+            None => {
                 eprintln!("BSC_PATH not set, skipping differential test");
                 return;
             }
         };
 
-        let libraries_dir = std::env::var("BSC_LIBRARIES_DIR")
-            .map(PathBuf::from)
-            .expect("BSC_LIBRARIES_DIR not set");
-
-        let mut exact_match = 0;
-        let mut diff_count = 0;
-        let mut parse_fail = 0;
-        let mut diff_files: Vec<(PathBuf, String, String)> = Vec::new();
-
-        for entry in walkdir::WalkDir::new(&libraries_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if !path.extension().map_or(false, |ext| ext == "bs") {
-                continue;
+        let libraries_dir = match get_libraries_dir() {
+            Some(d) => d,
+            None => {
+                eprintln!("BSC_LIBRARIES_DIR not set, skipping differential test");
+                return;
             }
+        };
 
-            let source = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Failed to read {}: {}", path.display(), e);
-                    parse_fail += 1;
-                    continue;
-                }
-            };
-
-            let haskell_output = Command::new(&bsc_path)
-                .arg("-show-csyntax")
-                .arg(path)
-                .output();
-
-            let haskell_csyntax = match haskell_output {
-                Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
-                Err(e) => {
-                    eprintln!("Failed to run bsc on {}: {}", path.display(), e);
-                    parse_fail += 1;
-                    continue;
-                }
-            };
-
-            let rust_pkg = match parse_package_with_file(&source, &path.to_string_lossy()) {
-                Ok(pkg) => pkg,
-                Err(errs) => {
-                    eprintln!("Rust parse failed for {}: {:?}", path.display(), errs.first());
-                    parse_fail += 1;
-                    continue;
-                }
-            };
-
-            let rust_csyntax = format!("{}", rust_pkg);
-
-            if haskell_csyntax.trim() == rust_csyntax.trim() {
-                exact_match += 1;
-                eprintln!("EXACT MATCH: {}", path.display());
-            } else {
-                diff_count += 1;
-                eprintln!("DIFF: {}", path.display());
-                diff_files.push((path.to_path_buf(), haskell_csyntax, rust_csyntax));
-            }
-        }
-
-        eprintln!("\n=== Summary ===");
-        eprintln!("Exact match: {}", exact_match);
-        eprintln!("Differences: {}", diff_count);
-        eprintln!("Parse failures: {}", parse_fail);
-
-        if !diff_files.is_empty() {
-            eprintln!("\n=== First difference detail ===");
-            let (path, haskell, rust) = &diff_files[0];
-            eprintln!("File: {}", path.display());
-            eprintln!("\n--- Haskell output (first 500 chars) ---");
-            eprintln!("{}", &haskell.chars().take(500).collect::<String>());
-            eprintln!("\n--- Rust output (first 500 chars) ---");
-            eprintln!("{}", &rust.chars().take(500).collect::<String>());
-
-            let h_chars: Vec<char> = haskell.chars().collect();
-            let r_chars: Vec<char> = rust.chars().collect();
-            for (i, (hc, rc)) in h_chars.iter().zip(r_chars.iter()).enumerate() {
-                if hc != rc {
-                    let start = i.saturating_sub(20);
-                    let end = (i + 20).min(h_chars.len().min(r_chars.len()));
-                    eprintln!("\nFirst diff at position {}:", i);
-                    eprintln!("  Haskell context: ...{}[{}]{}...",
-                        h_chars[start..i].iter().collect::<String>(),
-                        hc,
-                        h_chars[i+1..end].iter().collect::<String>());
-                    eprintln!("  Rust context:    ...{}[{}]{}...",
-                        r_chars[start..i].iter().collect::<String>(),
-                        rc,
-                        r_chars[i+1..end].iter().collect::<String>());
-                    break;
-                }
-            }
-
-            panic!("{} files had differences", diff_count);
-        }
+        run_differential_test_fail_fast(
+            SyntaxMode::Classic,
+            &libraries_dir,
+            &bsc_path,
+            |source, filename| {
+                parse_package_with_file(source, filename)
+                    .map_err(|errs| format!("{:?}", errs.first()))
+            },
+        );
     }
 }

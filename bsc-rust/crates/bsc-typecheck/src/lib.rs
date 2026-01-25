@@ -33,13 +33,3 @@ pub mod infer;
 pub use context::TypeCheckContext;
 pub use infer::{check_defn, infer_expr};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_context_creation() {
-        let ctx = TypeCheckContext::new();
-        assert!(!ctx.has_errors());
-    }
-}

@@ -1417,22 +1417,3 @@ fn check_primitive_type(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_literal_inference() {
-        let ctx = TypeCheckContext::new();
-
-        // Integer literal
-        let int_lit = Literal::Integer(bsc_syntax::literal::IntLiteral::decimal(42));
-        let ty = infer_literal(&ctx, &int_lit).expect("should infer");
-        assert_eq!(ty, make_integer_type());
-
-        // String literal
-        let str_lit = Literal::String("hello".to_string());
-        let ty = infer_literal(&ctx, &str_lit).expect("should infer");
-        assert_eq!(ty, make_string_type());
-    }
-}

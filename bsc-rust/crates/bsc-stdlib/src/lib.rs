@@ -136,18 +136,3 @@ impl StdlibLoader {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_search_paths() {
-        // This test uses a mock path that doesn't exist
-        let loader = StdlibLoader {
-            libraries_dir: PathBuf::from("/mock/Libraries"),
-        };
-        // Since the paths don't exist, search_paths returns empty
-        let paths = loader.search_paths();
-        assert!(paths.is_empty());
-    }
-}

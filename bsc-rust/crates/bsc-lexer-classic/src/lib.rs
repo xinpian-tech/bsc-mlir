@@ -1,7 +1,7 @@
-//! Hand-written lexer for BSC.
+//! Hand-written lexer for Classic Bluespec syntax.
 //!
 //! Mirrors `src/comp/Lex.hs` from the Haskell implementation.
-//! Supports both Classic and BSV syntax with layout rules.
+//! Supports layout rules for indentation-sensitive parsing.
 //!
 //! # Architecture
 //!
@@ -11,7 +11,6 @@
 //! - Hand-written character-by-character processing (not regex-based)
 //! - Layout rules for indentation-sensitive parsing
 //! - CPP directive handling (`# <line> "<file>"`)
-//! - Support for both Classic and BSV syntax modes
 //! - Sized bit literals (`8'hFF`, `16'b1010`)
 //! - Arbitrary precision integers (using `BigInt`)
 
@@ -25,20 +24,13 @@ use num_bigint::BigInt;
 use num_traits::Num;
 use std::str::Chars;
 
-/// Result type for lexer operations.
 pub type LexResult<T> = Result<T, LexError>;
 
-/// Tab stop width (matches Haskell BSC).
 const TAB_STOP: u32 = 8;
 
-/// Configuration flags for the lexer.
-///
-/// Mirrors `LFlags` from Haskell BSC's Lex.hs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LexerFlags {
-    /// Whether parsing a stdlib file (positions get annotated)
     pub is_stdlib: bool,
-    /// Whether to allow SystemVerilog keywords as identifiers
     pub allow_sv_keywords: bool,
 }
 
@@ -51,53 +43,28 @@ impl Default for LexerFlags {
     }
 }
 
-/// Syntax mode for the lexer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SyntaxMode {
-    /// Classic Bluespec syntax
-    #[default]
-    Classic,
-    /// BSV (SystemVerilog-like) syntax
-    Bsv,
-}
-
-/// The lexer state.
 #[derive(Debug)]
 pub struct Lexer<'src> {
-    /// Source text
     source: &'src str,
-    /// Characters iterator
     chars: Chars<'src>,
-    /// Current position in source (byte offset)
     pos: usize,
-    /// Current line (1-indexed, matches Haskell)
     line: u32,
-    /// Current column (0-indexed, matches Haskell)
     column: u32,
-    /// Lookahead character
     current: Option<char>,
-    /// Layout stack (column numbers for implicit braces)
     layout_stack: Vec<u32>,
-    /// Pending tokens from layout processing
     pending: Vec<Token>,
-    /// Syntax mode
-    mode: SyntaxMode,
-    /// Lexer flags
     flags: LexerFlags,
-    /// Current file name (for CPP directive handling)
     file_name: String,
 }
 
 impl<'src> Lexer<'src> {
-    /// Create a new lexer for the given source.
     #[must_use]
-    pub fn new(source: &'src str, mode: SyntaxMode) -> Self {
-        Self::with_file(source, mode, LexerFlags::default(), "")
+    pub fn new(source: &'src str) -> Self {
+        Self::with_file(source, LexerFlags::default(), "")
     }
 
-    /// Create a new lexer with a filename.
     #[must_use]
-    pub fn with_file(source: &'src str, mode: SyntaxMode, flags: LexerFlags, file_name: &str) -> Self {
+    pub fn with_file(source: &'src str, flags: LexerFlags, file_name: &str) -> Self {
         let mut chars = source.chars();
         let current = chars.next();
         Self {
@@ -105,46 +72,40 @@ impl<'src> Lexer<'src> {
             chars,
             pos: 0,
             line: 1,
-            column: 0, // 0-indexed to match Haskell
+            column: 0,
             current,
             layout_stack: Vec::new(),
             pending: Vec::new(),
-            mode,
             flags,
             file_name: file_name.to_string(),
         }
     }
 
-    /// Create a new lexer with specific flags (no filename).
     #[must_use]
-    pub fn with_flags(source: &'src str, mode: SyntaxMode, flags: LexerFlags) -> Self {
-        Self::with_file(source, mode, flags, "")
+    pub fn with_flags(source: &'src str, flags: LexerFlags) -> Self {
+        Self::with_file(source, flags, "")
     }
 
-    /// Get the current position.
     #[must_use]
     pub fn position(&self) -> Position {
         Position::full(
             self.file_name.as_str(),
             self.line as i32,
-            self.column as i32, // Column is 0-indexed like Haskell
+            self.column as i32,
             self.flags.is_stdlib,
         )
     }
 
-    /// Peek at the current character without consuming.
     #[must_use]
     fn peek(&self) -> Option<char> {
         self.current
     }
 
-    /// Peek at the next character (one ahead).
     #[must_use]
     fn peek_next(&self) -> Option<char> {
         self.chars.clone().next()
     }
 
-    /// Peek at the character two ahead.
     #[must_use]
     fn peek_next_next(&self) -> Option<char> {
         let mut iter = self.chars.clone();
@@ -152,7 +113,6 @@ impl<'src> Lexer<'src> {
         iter.next()
     }
 
-    /// Advance to the next character.
     fn advance(&mut self) -> Option<char> {
         let c = self.current;
         if let Some(ch) = c {
@@ -161,7 +121,6 @@ impl<'src> Lexer<'src> {
                 self.line += 1;
                 self.column = 0;
             } else if ch == '\t' {
-                // Tab handling: advance to next tab stop (matches Haskell: nextTab)
                 self.column = ((self.column + TAB_STOP) / TAB_STOP) * TAB_STOP;
             } else {
                 self.column += 1;
@@ -171,12 +130,6 @@ impl<'src> Lexer<'src> {
         c
     }
 
-    /// Calculate next tab stop position.
-    fn next_tab(col: u32) -> u32 {
-        ((col + TAB_STOP) / TAB_STOP) * TAB_STOP
-    }
-
-    /// Make a token at the given span with position info.
     fn make_token(&self, kind: TokenKind, start: u32, end: u32, start_line: u32, start_col: u32) -> Token {
         let pos = Position::full(
             self.file_name.as_str(),
@@ -187,18 +140,6 @@ impl<'src> Lexer<'src> {
         Token::new(kind, Span::new(start, end), pos)
     }
 
-    /// Make a token using current position as start (for simple tokens).
-    fn make_simple_token(&self, kind: TokenKind, start: u32, end: u32) -> Token {
-        let pos = Position::full(
-            self.file_name.as_str(),
-            self.line as i32,
-            self.column as i32, // Column is 0-indexed like Haskell
-            self.flags.is_stdlib,
-        );
-        Token::new(kind, Span::new(start, end), pos)
-    }
-
-    /// Skip whitespace and comments, returning whether we crossed a newline.
     fn skip_whitespace_and_comments(&mut self) -> LexResult<bool> {
         let mut crossed_newline = false;
         loop {
@@ -210,7 +151,6 @@ impl<'src> Lexer<'src> {
                     self.advance();
                 }
                 Some('\r') | Some('\x0B') | Some('\x0C') => {
-                    // Carriage return, vertical tab (\x0B), form feed (\x0C): reset column (matches Haskell)
                     self.column = 0;
                     self.advance();
                 }
@@ -218,28 +158,15 @@ impl<'src> Lexer<'src> {
                     self.advance();
                     crossed_newline = true;
                 }
-                // Line comment: --
                 Some('-') if self.peek_next() == Some('-') && self.is_comment_start() => {
                     self.skip_line_comment()?;
                     crossed_newline = true;
                 }
-                // Pragma: {-#
                 Some('{') if self.peek_next() == Some('-') && self.peek_next_next() == Some('#') => {
-                    // Don't skip pragmas - they are tokens
                     break;
                 }
-                // Block comment: {-
                 Some('{') if self.peek_next() == Some('-') => {
                     self.skip_block_comment()?;
-                }
-                // BSV line comment: //
-                Some('/') if self.mode == SyntaxMode::Bsv && self.peek_next() == Some('/') => {
-                    self.skip_bsv_line_comment()?;
-                    crossed_newline = true;
-                }
-                // BSV block comment: /* */
-                Some('/') if self.mode == SyntaxMode::Bsv && self.peek_next() == Some('*') => {
-                    self.skip_bsv_block_comment()?;
                 }
                 _ => break,
             }
@@ -247,45 +174,33 @@ impl<'src> Lexer<'src> {
         Ok(crossed_newline)
     }
 
-    /// Check if this is a valid comment start (-- followed by appropriate char).
-    /// Matches Haskell: isComm function.
     fn is_comment_start(&self) -> bool {
         let mut iter = self.chars.clone();
-        iter.next(); // skip first -
+        iter.next();
         match iter.next() {
-            Some('-') => true,  // ---
-            Some('@') => true,  // --@
+            Some('-') => true,
+            Some('@') => true,
             Some(c) if !is_symbol_char(c) => true,
             None => true,
             _ => false,
         }
     }
 
-    /// Skip a line comment (-- or //).
     fn skip_line_comment(&mut self) -> LexResult<()> {
         while let Some(c) = self.peek() {
             if c == '\n' {
-                self.advance(); // consume the newline
+                self.advance();
                 return Ok(());
             }
             self.advance();
         }
-        // EOF without newline - this is an error in Haskell BSC
-        // But we'll be lenient here and just return Ok
         Ok(())
     }
 
-    /// Skip a BSV-style line comment (//).
-    fn skip_bsv_line_comment(&mut self) -> LexResult<()> {
-        self.skip_line_comment()
-    }
-
-    /// Skip a block comment ({- -}).
     fn skip_block_comment(&mut self) -> LexResult<()> {
         let start_pos = self.position();
         let start_offset = self.pos as u32;
 
-        // Skip {-
         self.advance();
         self.advance();
 
@@ -316,43 +231,11 @@ impl<'src> Lexer<'src> {
         Ok(())
     }
 
-    /// Skip a BSV block comment (/* */).
-    fn skip_bsv_block_comment(&mut self) -> LexResult<()> {
-        let start_pos = self.position();
-        let start_offset = self.pos as u32;
-
-        // Skip /*
-        self.advance();
-        self.advance();
-
-        loop {
-            match self.peek() {
-                None => {
-                    return Err(LexError::UnterminatedBlockComment {
-                        position: start_pos.clone(),
-                        span: Span::new(start_offset, self.pos as u32).into(),
-                    });
-                }
-                Some('*') if self.peek_next() == Some('/') => {
-                    self.advance();
-                    self.advance();
-                    break;
-                }
-                _ => {
-                    self.advance();
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Handle CPP directive at column 0: # <line> "<file>"
     fn try_cpp_directive(&mut self) -> bool {
         if self.column != 0 || self.peek() != Some('#') {
             return false;
         }
 
-        // Check for: # <space> <digit>
         let mut iter = self.chars.clone();
         if iter.next() != Some(' ') {
             return false;
@@ -362,11 +245,9 @@ impl<'src> Lexer<'src> {
             _ => return false,
         }
 
-        // This is a CPP directive, consume it
-        self.advance(); // skip #
-        self.advance(); // skip space
+        self.advance();
+        self.advance();
 
-        // Parse line number
         let mut line_str = String::new();
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
@@ -377,15 +258,13 @@ impl<'src> Lexer<'src> {
             }
         }
 
-        // Skip space(s)
         while self.peek() == Some(' ') {
             self.advance();
         }
 
-        // Parse filename (in quotes)
         let mut file_name = String::new();
         if self.peek() == Some('"') {
-            self.advance(); // skip opening quote
+            self.advance();
             while let Some(c) = self.peek() {
                 if c == '"' {
                     self.advance();
@@ -399,19 +278,17 @@ impl<'src> Lexer<'src> {
             }
         }
 
-        // Skip rest of line (flags, etc.)
         while let Some(c) = self.peek() {
             if c == '\n' {
-                self.advance(); // consume newline
+                self.advance();
                 break;
             }
             self.advance();
         }
 
-        // Update position
         if let Ok(new_line) = line_str.parse::<u32>() {
             self.line = new_line;
-            self.column = 0;
+            self.column = 1;
         }
         if !file_name.is_empty() {
             self.file_name = file_name;
@@ -420,16 +297,12 @@ impl<'src> Lexer<'src> {
         true
     }
 
-    /// Get the next token.
     pub fn next_token(&mut self) -> LexResult<Token> {
-        // Return pending tokens first (from layout processing)
         if let Some(tok) = self.pending.pop() {
             return Ok(tok);
         }
 
-        // Handle CPP directives at column 0
         while self.try_cpp_directive() {
-            // Keep processing directives
         }
 
         let _crossed_newline = self.skip_whitespace_and_comments()?;
@@ -438,23 +311,29 @@ impl<'src> Lexer<'src> {
         let start_offset = self.pos as u32;
 
         let kind = match self.peek() {
-            None => TokenKind::Eof,
+            None => {
+                let eof_pos = Position::full(
+                    self.file_name.as_str(),
+                    (self.line + 1) as i32,
+                    -1,
+                    self.flags.is_stdlib,
+                );
+                let tok = Token::new(TokenKind::Eof, Span::new(start_offset, start_offset), eof_pos);
+                return Ok(tok);
+            }
             Some(c) => match c {
-                // Pragma: {-#
                 '{' if self.peek_next() == Some('-') && self.peek_next_next() == Some('#') => {
                     self.advance();
                     self.advance();
                     self.advance();
                     TokenKind::LPragma
                 }
-                // Close pragma: #-}
                 '#' if self.peek_next() == Some('-') && self.peek_next_next() == Some('}') => {
                     self.advance();
                     self.advance();
                     self.advance();
                     TokenKind::RPragma
                 }
-                // Delimiters
                 '(' => { self.advance(); TokenKind::LParen }
                 ')' => { self.advance(); TokenKind::RParen }
                 ',' => { self.advance(); TokenKind::Comma }
@@ -464,26 +343,28 @@ impl<'src> Lexer<'src> {
                 '}' => { self.advance(); TokenKind::RBrace }
                 '[' => { self.advance(); TokenKind::LBracket }
                 ']' => { self.advance(); TokenKind::RBracket }
-                // Dot is special: could be . or ..
-                '.' if self.peek_next() == Some('.') => {
-                    self.advance();
-                    self.advance();
-                    TokenKind::DotDot
-                }
                 '.' => { self.advance(); TokenKind::Dot }
-                // Character literal
                 '\'' => self.lex_char()?,
-                // String literal
                 '"' => self.lex_string()?,
-                // Numbers (and sized literals like 8'hFF)
                 c if c.is_ascii_digit() => self.lex_number()?,
-                // $ identifier or $ symbol
                 '$' => self.lex_dollar()?,
-                // Symbol/operator
                 c if is_symbol_char(c) => self.lex_symbol()?,
-                // Identifiers and keywords
-                c if c.is_ascii_alphabetic() || c == '_' => self.lex_identifier()?,
-                // Unknown character
+                c if c.is_ascii_alphabetic() || c == '_' => {
+                    let kind = self.lex_identifier()?;
+                    let end_offset = self.pos as u32;
+                    let col = if kind == TokenKind::KwPackage {
+                        start_pos.column as i32 - 1
+                    } else {
+                        start_pos.column as i32
+                    };
+                    let pos = Position::full(
+                        self.file_name.as_str(),
+                        start_pos.line as i32,
+                        col,
+                        self.flags.is_stdlib,
+                    );
+                    return Ok(Token::new(kind, Span::new(start_offset, end_offset), pos));
+                }
                 _ => {
                     let pos = self.position();
                     self.advance();
@@ -500,7 +381,6 @@ impl<'src> Lexer<'src> {
         Ok(self.make_token(kind, start_offset, end_offset, start_pos.line as u32, start_pos.column as u32))
     }
 
-    /// Lex a lowercase identifier or keyword.
     fn lex_identifier(&mut self) -> LexResult<TokenKind> {
         let start = self.pos;
         while let Some(c) = self.peek() {
@@ -512,14 +392,11 @@ impl<'src> Lexer<'src> {
         }
         let text = &self.source[start..self.pos];
 
-        // Check for underscore (special token)
         if text == "_" {
             return Ok(TokenKind::Underscore);
         }
 
-        // Check for keywords
         let kind = match text {
-            // Reserved words (Classic)
             "action" => TokenKind::KwAction,
             "case" => TokenKind::KwCase,
             "class" => TokenKind::KwClass,
@@ -556,18 +433,6 @@ impl<'src> Lexer<'src> {
             "where" => TokenKind::KwWhere,
             "coherent" => TokenKind::KwCoherent,
             "incoherent" => TokenKind::KwIncoherent,
-            // BSV-specific keywords (only recognized in BSV mode)
-            "actionvalue" if self.mode == SyntaxMode::Bsv => TokenKind::KwActionValue,
-            "export" if self.mode == SyntaxMode::Bsv => TokenKind::KwExport,
-            "for" if self.mode == SyntaxMode::Bsv => TokenKind::KwFor,
-            "function" if self.mode == SyntaxMode::Bsv => TokenKind::KwFunction,
-            "match" if self.mode == SyntaxMode::Bsv => TokenKind::KwMatch,
-            "matches" if self.mode == SyntaxMode::Bsv => TokenKind::KwMatches,
-            "method" if self.mode == SyntaxMode::Bsv => TokenKind::KwMethod,
-            "return" if self.mode == SyntaxMode::Bsv => TokenKind::KwReturn,
-            "rule" if self.mode == SyntaxMode::Bsv => TokenKind::KwRule,
-            "while" if self.mode == SyntaxMode::Bsv => TokenKind::KwWhile,
-            // Not a keyword - check if constructor or variable
             _ => {
                 let first_char = text.chars().next().unwrap_or('a');
                 if first_char.is_ascii_uppercase() {
@@ -581,14 +446,11 @@ impl<'src> Lexer<'src> {
         Ok(kind)
     }
 
-    /// Lex a $ identifier or symbol.
     fn lex_dollar(&mut self) -> LexResult<TokenKind> {
         let start = self.pos;
-        self.advance(); // consume $
+        self.advance();
 
-        // Check what follows
         match self.peek() {
-            // $identifier
             Some(c) if is_id_char(c) => {
                 while let Some(c) = self.peek() {
                     if is_id_char(c) || c == '$' {
@@ -600,16 +462,15 @@ impl<'src> Lexer<'src> {
                 let text = &self.source[start..self.pos];
                 Ok(TokenKind::VarId(text.into()))
             }
-            // Just $ by itself
-            _ => Ok(TokenKind::VarSym("$".into())),
+            _ => {
+                Ok(TokenKind::VarSym("$".into()))
+            }
         }
     }
 
-    /// Lex a symbol/operator.
     fn lex_symbol(&mut self) -> LexResult<TokenKind> {
         let start = self.pos;
 
-        // Collect all symbol characters
         while let Some(c) = self.peek() {
             if is_symbol_char(c) {
                 self.advance();
@@ -620,9 +481,6 @@ impl<'src> Lexer<'src> {
 
         let text = &self.source[start..self.pos];
 
-        // Check for reserved operators
-        // Note: "|" is NOT a reserved operator - it's a regular VarSym so it can be used
-        // in fixity declarations like "infixr 4 |"
         let kind = match text {
             "::" => TokenKind::ColonColon,
             ":" => TokenKind::Colon,
@@ -630,13 +488,9 @@ impl<'src> Lexer<'src> {
             "@" => TokenKind::At,
             "\\" => TokenKind::Backslash,
             "->" => TokenKind::Arrow,
-            "<=>" => TokenKind::VarSym(text.into()), // Not a reserved operator
             "==>" => TokenKind::DArrow,
             "=>" => TokenKind::FatArrow,
             "<-" => TokenKind::LArrow,
-            "#" => TokenKind::Hash,
-            "?" => TokenKind::Question,
-            // Not a reserved operator - check if consym or varsym
             _ => {
                 if text.starts_with(':') {
                     TokenKind::ConSym(text.into())
@@ -649,48 +503,44 @@ impl<'src> Lexer<'src> {
         Ok(kind)
     }
 
-    /// Lex a number (integer or float, including sized literals).
     fn lex_number(&mut self) -> LexResult<TokenKind> {
         let start = self.pos;
         let start_pos = self.position();
 
-        // Check for 0x, 0o, 0b prefix
         if self.peek() == Some('0') {
             let next = self.peek_next();
             match next {
                 Some('x') | Some('X') => {
-                    self.advance(); // 0
-                    self.advance(); // x
+                    self.advance();
+                    self.advance();
                     return self.lex_integer_with_base(16, start, start_pos, None);
                 }
                 Some('o') | Some('O') => {
-                    self.advance(); // 0
-                    self.advance(); // o
+                    self.advance();
+                    self.advance();
                     return self.lex_integer_with_base(8, start, start_pos, None);
                 }
                 Some('b') | Some('B') => {
-                    self.advance(); // 0
-                    self.advance(); // b
+                    self.advance();
+                    self.advance();
                     return self.lex_integer_with_base(2, start, start_pos, None);
                 }
                 _ => {}
             }
         }
 
-        // Collect decimal digits
         let mut int_part = String::new();
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
                 int_part.push(c);
                 self.advance();
             } else if c == '_' {
-                self.advance(); // skip underscores
+                self.advance();
             } else {
                 break;
             }
         }
 
-        // Check for sized literal: N'bXXX, N'oXXX, N'dXXX, N'hXXX
         if self.peek() == Some('\'') {
             let size = BigInt::from_str_radix(&int_part, 10)
                 .map_err(|_| LexError::InvalidInteger {
@@ -700,9 +550,9 @@ impl<'src> Lexer<'src> {
                     span: Span::new(start as u32, self.pos as u32).into(),
                 })?;
 
-            self.advance(); // consume '
+            self.advance();
             let format_char = self.peek();
-            self.advance(); // consume format character
+            self.advance();
 
             let base = match format_char {
                 Some('h') | Some('H') => 16,
@@ -722,9 +572,8 @@ impl<'src> Lexer<'src> {
             return self.lex_integer_with_base(base, start, start_pos, Some(size));
         }
 
-        // Check for decimal point (float)
         if self.peek() == Some('.') && self.peek_next().is_some_and(|c| c.is_ascii_digit()) {
-            self.advance(); // consume .
+            self.advance();
 
             let mut frac_part = String::new();
             while let Some(c) = self.peek() {
@@ -736,23 +585,7 @@ impl<'src> Lexer<'src> {
                 }
             }
 
-            // Check for exponent
-            let mut exp_part = String::new();
-            if matches!(self.peek(), Some('e') | Some('E')) {
-                exp_part.push(self.advance().unwrap_or('e'));
-                if matches!(self.peek(), Some('+') | Some('-')) {
-                    exp_part.push(self.advance().unwrap_or('+'));
-                }
-                while let Some(c) = self.peek() {
-                    if c.is_ascii_digit() {
-                        exp_part.push(c);
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-            }
-
+            let exp_part = self.lex_exponent_part();
             let full_str = format!("{int_part}.{frac_part}{exp_part}");
             let value: f64 = full_str.parse().map_err(|_| LexError::InvalidInteger {
                 literal: full_str.clone(),
@@ -764,11 +597,27 @@ impl<'src> Lexer<'src> {
             return Ok(TokenKind::Float(OrderedFloat::new(value)));
         }
 
-        // Check for exponent without decimal (still a float in some languages, but in BSC it's an error)
-        // Actually in BSC, this becomes an integer followed by identifier 'e...'
-        // So we just return the integer
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            let next = self.peek_next();
+            let is_exponent = match next {
+                Some(c) if c.is_ascii_digit() => true,
+                Some('+') | Some('-') => self.peek_next_next().is_some_and(|c| c.is_ascii_digit()),
+                _ => false,
+            };
+            if is_exponent {
+                let exp_part = self.lex_exponent_part();
+                let full_str = format!("{int_part}{exp_part}");
+                let value: f64 = full_str.parse().map_err(|_| LexError::InvalidInteger {
+                    literal: full_str.clone(),
+                    position: start_pos.clone(),
+                    reason: "invalid float literal".to_string(),
+                    span: Span::new(start as u32, self.pos as u32).into(),
+                })?;
 
-        // Plain integer
+                return Ok(TokenKind::Float(OrderedFloat::new(value)));
+            }
+        }
+
         let value = BigInt::from_str_radix(&int_part, 10).map_err(|_| LexError::InvalidInteger {
             literal: int_part.clone(),
             position: start_pos.clone(),
@@ -783,7 +632,25 @@ impl<'src> Lexer<'src> {
         })
     }
 
-    /// Lex an integer with a specific base.
+    fn lex_exponent_part(&mut self) -> String {
+        let mut exp_part = String::new();
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            exp_part.push(self.advance().unwrap_or('e'));
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                exp_part.push(self.advance().unwrap_or('+'));
+            }
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    exp_part.push(c);
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        exp_part
+    }
+
     fn lex_integer_with_base(
         &mut self,
         base: u32,
@@ -827,12 +694,11 @@ impl<'src> Lexer<'src> {
         Ok(TokenKind::Integer { size, base, value })
     }
 
-    /// Lex a string literal.
     fn lex_string(&mut self) -> LexResult<TokenKind> {
         let start_pos = self.position();
         let start = self.pos as u32;
 
-        self.advance(); // consume opening "
+        self.advance();
 
         let mut value = String::new();
         loop {
@@ -865,12 +731,11 @@ impl<'src> Lexer<'src> {
         Ok(TokenKind::String(value))
     }
 
-    /// Lex a character literal.
     fn lex_char(&mut self) -> LexResult<TokenKind> {
         let start_pos = self.position();
         let start = self.pos as u32;
 
-        self.advance(); // consume opening '
+        self.advance();
 
         let c = match self.peek() {
             None | Some('\n') | Some('\'') => {
@@ -899,23 +764,21 @@ impl<'src> Lexer<'src> {
                 span: Span::new(start, self.pos as u32).into(),
             });
         }
-        self.advance(); // consume closing '
+        self.advance();
 
         Ok(TokenKind::Char(c))
     }
 
-    /// Lex an escape sequence (after the backslash).
     fn lex_escape_sequence(&mut self, start_pos: Position, start: u32) -> LexResult<char> {
         match self.peek() {
             Some('n') => { self.advance(); Ok('\n') }
             Some('t') => { self.advance(); Ok('\t') }
             Some('r') => { self.advance(); Ok('\r') }
-            Some('v') => { self.advance(); Ok('\x0B') }  // vertical tab
-            Some('f') => { self.advance(); Ok('\x0C') }  // form feed
+            Some('v') => { self.advance(); Ok('\x0B') }
+            Some('f') => { self.advance(); Ok('\x0C') }
             Some('\\') => { self.advance(); Ok('\\') }
             Some('"') => { self.advance(); Ok('"') }
             Some('\'') => { self.advance(); Ok('\'') }
-            Some('0') => { self.advance(); Ok('\0') }
             Some('x') => {
                 self.advance();
                 let mut hex = String::new();
@@ -958,7 +821,6 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    /// Tokenize the entire source.
     pub fn tokenize(mut self) -> LexResult<Vec<Token>> {
         let mut tokens = Vec::new();
         loop {
@@ -973,14 +835,11 @@ impl<'src> Lexer<'src> {
     }
 }
 
-/// Check if a character can be part of an identifier.
-/// Matches Haskell BSC's `isIdChar`.
 #[inline]
 fn is_id_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '\''
 }
 
-/// Check if a character is a valid digit for the given base.
 #[inline]
 fn is_digit_for_base(c: char, base: u32) -> bool {
     match base {
@@ -992,8 +851,6 @@ fn is_digit_for_base(c: char, base: u32) -> bool {
     }
 }
 
-/// Check if a character can be part of a symbol/operator.
-/// Matches Haskell BSC's `isSym`.
 #[inline]
 fn is_symbol_char(c: char) -> bool {
     matches!(c,
@@ -1002,24 +859,10 @@ fn is_symbol_char(c: char) -> bool {
     ) || (c >= '\u{80}' && is_unicode_symbol(c))
 }
 
-/// Check if a Unicode character is a symbol (mirrors Haskell's handling).
-/// Haskell's `isSymbol` returns True for Unicode categories:
-/// - MathSymbol, CurrencySymbol, ModifierSymbol, OtherSymbol
 fn is_unicode_symbol(c: char) -> bool {
-    // Common symbol ranges used in Bluespec
     matches!(c,
-        '\u{00A2}'..='\u{00BF}' | // Currency and special symbols (Latin-1 Supplement)
-        '\u{00D7}' | '\u{00F7}' | // Multiplication and division signs
-        '\u{2200}'..='\u{22FF}' | // Mathematical Operators (includes ∘ at U+2218)
-        '\u{2300}'..='\u{23FF}' | // Miscellaneous Technical
-        '\u{25A0}'..='\u{25FF}' | // Geometric Shapes
-        '\u{2600}'..='\u{26FF}' | // Miscellaneous Symbols
-        '\u{2700}'..='\u{27BF}' | // Dingbats
-        '\u{27C0}'..='\u{27EF}' | // Miscellaneous Mathematical Symbols-A
-        '\u{27F0}'..='\u{27FF}' | // Supplemental Arrows-A
-        '\u{2900}'..='\u{297F}' | // Supplemental Arrows-B
-        '\u{2980}'..='\u{29FF}' | // Miscellaneous Mathematical Symbols-B
-        '\u{2A00}'..='\u{2AFF}'   // Supplemental Mathematical Operators
-    ) || (c.is_ascii_punctuation() && !is_id_char(c))
+        '\u{00A2}'..='\u{00B5}' |
+        '\u{00B7}'..='\u{00BF}' |
+        '\u{00D7}' | '\u{00F7}'
+    ) || (c.is_alphabetic() == false && c.is_alphanumeric() == false && !is_id_char(c))
 }
-
