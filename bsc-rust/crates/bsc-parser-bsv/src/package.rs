@@ -4,12 +4,13 @@
 //! Mirrors the package parsing functions from `src/comp/Parser/BSV/CVParser.lhs`.
 
 use crate::imperative::{ImperativeFlags, ImperativeStatement, ImperativeStmtContext};
+use crate::imperative_parsing;
 use bsc_diagnostics::{Position, Span};
 use bsc_lexer_bsv::TokenKind;
 use bsc_syntax::csyntax::*;
 use bsc_syntax::id::Id;
 // use bsc_syntax::literal::{IntLiteral, Literal}; // Unused for now
-use chumsky::input::{MappedInput, Input};
+use chumsky::input::{MappedInput, Input, ValueInput};
 use chumsky::prelude::*;
 use smol_str::SmolStr;
 use num_bigint::BigInt;
@@ -37,10 +38,10 @@ fn to_span(simple_span: SimpleSpan<u32>) -> Span {
     Span::new(simple_span.start, simple_span.end)
 }
 
-/// Convert SimpleSpan to Position (using start of span).
-/// For now, we use Position::unknown() since we don't have file/line info in spans.
-fn to_position(_simple_span: SimpleSpan<u32>) -> Position {
-    Position::unknown()
+/// Convert SimpleSpan to Position by looking up from the global position map.
+/// Mirrors Haskell's approach where each Token carries its Position.
+fn to_position(simple_span: SimpleSpan<u32>) -> Position {
+    crate::lookup_position(simple_span.start)
 }
 
 /// Check if an ImperativeStatement is an import.
@@ -270,6 +271,17 @@ fn parse_export<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CExport>, ParserEx
 }
 
 // ============================================================================
+// Fixity Declaration Parsing (BSV Note)
+// ============================================================================
+//
+// NOTE: BSV (SystemVerilog-style) syntax does not support Haskell-style
+// fixity declarations (infix, infixl, infixr). These are only available
+// in Classic Bluespec syntax. The Haskell BSV parser hardcodes fixities
+// to [] in CVParser.lhs: `return $ CPackage name exports imports [] defs []`
+//
+// Therefore, we don't need to implement fixity parsing for BSV.
+
+// ============================================================================
 // Import Parsing (mirrors pImportItem)
 // ============================================================================
 
@@ -311,12 +323,11 @@ fn parse_package_decl<'a>() -> impl Parser<'a, TokenStream<'a>, Id, ParserExtra<
 // Imperative Statement Conversion
 // ============================================================================
 
-/// Convert ImperativeStatement to CDefn (simplified for now).
-/// This should call `imperativeToCDefns` from the Haskell implementation.
-fn imperative_to_cdefns(_stmts: Vec<ImperativeStatement>) -> Vec<CDefn> {
-    // TODO: Implement full conversion from ImperativeStatement to CDefn
-    // For now, return empty list to allow compilation
-    Vec::new()
+/// Convert ImperativeStatement to CDefn.
+/// Mirrors `imperativeToCDefns` from Haskell BSC.
+fn imperative_to_cdefns(stmts: Vec<ImperativeStatement>) -> Vec<CDefn> {
+    let (_, _, definitions) = crate::imperative::convert_top_statements_to_csyntax(stmts);
+    definitions
 }
 
 /// Create default imperative flags for top-level parsing.
@@ -358,16 +369,18 @@ fn toplevel_flags() -> ImperativeFlags {
 /// Mirrors `pPackage` from CVParser.lhs.
 pub fn parse_package<'a>(
     default_pkg_name: String,
+    includes: Vec<String>,
 ) -> impl Parser<'a, TokenStream<'a>, CPackage, ParserExtra<'a>> + Clone {
+    let includes_clone = includes.clone();
     // Optional package declaration
     parse_package_decl()
         .or_not()
         .then(
-            // TODO: Parse imperative statements with toplevel flags
-            // For now, parse basic import/export statements
+            // Parse imperative statements with toplevel flags
             choice((
                 parse_import().map(ImperativeStatement::Import),
                 parse_export().map(ImperativeStatement::Export),
+                imperative_parsing::parse_imperative_statements(),
             ))
             .repeated()
             .collect::<Vec<_>>(),
@@ -377,7 +390,7 @@ pub fn parse_package<'a>(
             keyword(TokenKind::KwEndpackage).or_not(),
         )
         .then_ignore(end())
-        .map_with(move |(pkg_name, stmts): (Option<Id>, Vec<ImperativeStatement>), e| {
+        .validate(move |(pkg_name, stmts): (Option<Id>, Vec<ImperativeStatement>), e, emitter| {
             let default_id = make_id(SmolStr::from(&default_pkg_name), to_position(e.span()));
             let name = pkg_name.unwrap_or(default_id);
 
@@ -396,14 +409,18 @@ pub fn parse_package<'a>(
                 })
                 .collect();
 
-            // Check for self-imports (prohibited)
+            // Check for self-imports (prohibited) - mirrors CVParser.lhs behavior
             let self_imports: Vec<_> = import_pkgs
                 .iter()
                 .filter(|pkg| pkg.name() == name.name())
                 .collect();
             if !self_imports.is_empty() {
-                // TODO: Report error for circular imports
-                // For now, continue with parsing
+                // Report error for circular imports (mirrors CVParser.lhs behavior)
+                let bad_import = self_imports[0]; // Take the first one like Haskell
+                emitter.emit(Rich::custom(
+                    e.span(),
+                    format!("Circular package importing: {}", bad_import.name()),
+                ));
             }
 
             // Create CImport list
@@ -441,9 +458,9 @@ pub fn parse_package<'a>(
                 name,
                 exports,
                 imports,
-                fixities: Vec::new(), // TODO: Parse fixity declarations
+                fixities: Vec::new(), // BSV doesn't support fixity declarations (only Classic does)
                 definitions,
-                includes: Vec::new(), // TODO: Parse include files
+                includes: includes_clone.iter().map(|s| CInclude(s.clone())).collect(),
                 span: to_span(e.span()),
             }
         })
@@ -454,21 +471,72 @@ pub fn parse_package<'a>(
 // Public API
 // ============================================================================
 
+/// Extract references from tuple for chumsky mapping.
+fn map_tuple(item: &(TokenKind, SimpleSpan<u32>)) -> (&TokenKind, &SimpleSpan<u32>) {
+    (&item.0, &item.1)
+}
+
+/// Convert AttValue to Option<CExpr> for attribute values.
+fn attr_value_to_expr(value: AttValue) -> Option<CExpr> {
+    use bsc_syntax::literal::{IntBase, IntLiteral, Literal};
+    match value {
+        AttValue::Num(pos, num) => {
+            let int_val = num.try_into().unwrap_or(0);
+            let int_lit = IntLiteral {
+                value: int_val,
+                width: None,
+                base: IntBase::Decimal,
+            };
+            Some(CExpr::Lit(Literal::Integer(int_lit), pos))
+        }
+        AttValue::String(pos, s) => Some(CExpr::Lit(Literal::String(s), pos)),
+        AttValue::List(_, _) => None, // Complex list attributes not yet supported
+    }
+}
+
 /// Parse a BSV package from a token stream.
 pub fn parse_bsv_package(
     tokens: Vec<(TokenKind, SimpleSpan<u32>)>,
     default_pkg_name: String,
 ) -> Result<CPackage, Vec<Rich<'static, TokenKind, SimpleSpan<u32>>>> {
-    // For now, just return a simple empty package to resolve compilation
-    // TODO: Implement proper parsing once the lifetime issues are resolved
-    Ok(CPackage {
-        name: Id::unpositioned(SmolStr::from(default_pkg_name)),
-        exports: ExportSpec::Only(vec![]),
-        imports: vec![],
-        definitions: vec![],
-        fixities: vec![],
-        includes: vec![],
-        span: Span::DUMMY,
-    })
+    parse_bsv_package_with_includes(tokens, default_pkg_name, Vec::new())
+}
+
+/// Parse a BSV package from a token stream with include files.
+pub fn parse_bsv_package_with_includes(
+    tokens: Vec<(TokenKind, SimpleSpan<u32>)>,
+    default_pkg_name: String,
+    includes: Vec<String>,
+) -> Result<CPackage, Vec<Rich<'static, TokenKind, SimpleSpan<u32>>>> {
+    // Calculate end-of-input span for the parser
+    let eoi = tokens
+        .last()
+        .map(|(_, s)| s.end)
+        .unwrap_or(0);
+    let eoi_span: SimpleSpan<u32> = SimpleSpan::new((), eoi..eoi);
+
+    // Create a mapped input suitable for chumsky, using function pointer coercion
+    let map_fn: fn(&(TokenKind, SimpleSpan<u32>)) -> (&TokenKind, &SimpleSpan<u32>) = map_tuple;
+    let input = tokens.as_slice().map(eoi_span, map_fn);
+
+    // Use the chumsky parser to parse the package
+    let result = parse_package(default_pkg_name, includes).parse(input);
+
+    // Convert result to expected format
+    match result.into_result() {
+        Ok(pkg) => Ok(pkg),
+        Err(errors) => {
+            // Convert errors to the expected type by creating new errors with 'static lifetime
+            let static_errors: Vec<Rich<'static, TokenKind, SimpleSpan<u32>>> = errors
+                .into_iter()
+                .map(|e| {
+                    // Extract span and create a new error with static lifetime
+                    let span = *e.span();
+                    Rich::custom(span, format!("{:?}", e.reason()))
+                })
+                .collect();
+            Err(static_errors)
+        }
+    }
 }
 

@@ -73,12 +73,9 @@ pub enum ImperativeStatement {
     ModuleDefn {
         pos: Position,
         name: Id,
-        params: Vec<(Id, CType, bool)>,
-        ret_type: Option<CType>,
-        ifc_type: Option<CType>,
-        provisos: Vec<CPred>,
-        body: Vec<ImperativeStatement>,
-        attrs: Vec<(Id, Option<CExpr>)>,
+        pragma: Option<CPragma>,
+        module_type: CQType,
+        def_clause: CClause,
     },
 
     FunctionDefn {
@@ -237,6 +234,20 @@ pub enum ImperativeStatement {
         members: Vec<ImperativeStatement>,
     },
 
+    /// Module instantiation statement
+    /// Corresponds to ISInst in Haskell BSC
+    Inst {
+        pos: Position,
+        attrs: Vec<(Position, CPragma)>,
+        ifc_var: Id,    // interface variable name
+        inst_var: Id,   // instance variable name
+        ifc_type: Option<CType>,  // interface type
+        clocked_by: Option<CExpr>, // clocked_by expression
+        reset_by: Option<CExpr>,   // reset_by expression
+        powered_by: Option<CExpr>, // powered_by expression
+        constructor: CExpr,        // module constructor expression
+    },
+
     #[allow(dead_code)]
     Attributes(Vec<(Id, Option<CExpr>)>),
 }
@@ -244,9 +255,6 @@ pub enum ImperativeStatement {
 impl ImperativeStatement {
     pub fn set_attributes(&mut self, new_attrs: Vec<(Id, Option<CExpr>)>) {
         match self {
-            ImperativeStatement::ModuleDefn { attrs, .. } => {
-                *attrs = new_attrs;
-            }
             ImperativeStatement::FunctionDefn { attrs, .. } => {
                 *attrs = new_attrs;
             }
@@ -298,57 +306,19 @@ pub fn convert_top_statements_to_csyntax(
                 }));
             }
             ImperativeStatement::ModuleDefn {
-                pos,
                 name,
-                params,
-                provisos,
-                body,
-                ifc_type,
-                attrs,
+                pragma,
+                module_type,
+                def_clause,
                 ..
             } => {
-                let has_synthesize = attrs.iter().any(|(n, _)| n.name() == "synthesize");
-                let param_names: Vec<Id> = params
-                    .iter()
-                    .filter(|(_, _, is_param)| *is_param)
-                    .map(|(n, _, _)| n.clone())
-                    .collect();
-
-                if has_synthesize {
-                    let mut props = vec![CPragmaProperty {
-                        name: "verilog".to_string(),
-                        value: None,
-                    }];
-                    if !param_names.is_empty() {
-                        props.push(CPragmaProperty {
-                            name: "param".to_string(),
-                            value: Some(param_names.iter().map(|id| id.name().as_str()).collect::<Vec<_>>().join(" ")),
-                        });
-                    }
-                    definitions.push(CDefn::Pragma(CPragma::Properties(
-                        name.clone(),
-                        props,
-                    )));
+                if let Some(prag) = pragma {
+                    definitions.push(CDefn::Pragma(prag));
                 }
-
-                let ifc = ifc_type.unwrap_or_else(|| {
-                    CType::Con(Id::qualified("Prelude", "Empty", Position::unknown()))
-                });
-                let ifc_id = extract_interface_id(&ifc);
-                let body_expr = convert_module_body_to_expr(body, pos, ifc_id);
-                let params_for_type: Vec<(Id, CType)> = params.iter().map(|(n, t, _)| (n.clone(), t.clone())).collect();
-                let module_type = build_module_type(params_for_type, provisos, ifc);
-
-                let patterns: Vec<CPat> = params.into_iter().map(|(n, _, _)| CPat::Var(n)).collect();
                 definitions.push(CDefn::ValueSign(CDef::Untyped {
                     name,
                     ty: module_type,
-                    clauses: vec![CClause {
-                        patterns,
-                        qualifiers: vec![],
-                        body: body_expr,
-                        span: Span::DUMMY,
-                    }],
+                    clauses: vec![def_clause],
                     span: Span::DUMMY,
                 }));
             }
@@ -3082,4 +3052,444 @@ fn convert_action_stmts_to_stmts_inner(stmts: Vec<ImperativeStatement>, at_top_l
     }
 
     result
+}
+
+pub fn imperative_to_cstmts(
+    context: ImperativeStmtContext,
+    ifc_type: Option<CType>,
+    stmts: Vec<ImperativeStatement>,
+) -> Vec<CStmt> {
+    conv_imperative_stmts_to_cstmts(context, ifc_type, true, stmts)
+}
+
+fn conv_imperative_stmts_to_cstmts(
+    context: ImperativeStmtContext,
+    ifc_type: Option<CType>,
+    at_end: bool,
+    stmts: Vec<ImperativeStatement>,
+) -> Vec<CStmt> {
+    if stmts.is_empty() {
+        if at_end && matches!(context, ImperativeStmtContext::ISCIsModule | ImperativeStmtContext::ISCModule) {
+            let ifc_id = ifc_type.as_ref().and_then(left_con);
+            let ifc_expr = CExpr::Interface(Position::unknown(), ifc_id, vec![]);
+            let return_expr = CExpr::Apply(
+                Box::new(CExpr::Var(Id::qualified("Prelude", "return", Position::unknown()))),
+                vec![ifc_expr],
+                Span::DUMMY,
+            );
+            return vec![CStmt::Expr {
+                instance_name: None,
+                expr: return_expr,
+                span: Span::DUMMY,
+            }];
+        }
+        return vec![];
+    }
+
+    let mut result = Vec::new();
+    let len = stmts.len();
+
+    for (i, stmt) in stmts.into_iter().enumerate() {
+        let is_last = i == len - 1;
+        let stmt_at_end = at_end && is_last;
+
+        match stmt {
+            ImperativeStatement::Decl { name, ty, init } => {
+                let body_expr = init.unwrap_or_else(|| {
+                    CExpr::Apply(
+                        Box::new(CExpr::Var(Id::qualified("Prelude", "primUninitialized", Position::unknown()))),
+                        vec![
+                            CExpr::Lit(Literal::Position, name.position().clone()),
+                            CExpr::Lit(Literal::String(name.name().to_string()), name.position().clone()),
+                        ],
+                        Span::DUMMY,
+                    )
+                });
+                let defl = if let Some(decl_type) = ty {
+                    CDefl::ValueSign(
+                        CDef::Untyped {
+                            name,
+                            ty: CQType {
+                                context: vec![],
+                                ty: decl_type,
+                                span: Span::DUMMY,
+                            },
+                            clauses: vec![CClause {
+                                patterns: vec![],
+                                qualifiers: vec![],
+                                body: body_expr,
+                                span: Span::DUMMY,
+                            }],
+                            span: Span::DUMMY,
+                        },
+                        vec![],
+                        Span::DUMMY,
+                    )
+                } else {
+                    CDefl::Value(
+                        name,
+                        vec![CClause {
+                            patterns: vec![],
+                            qualifiers: vec![],
+                            body: body_expr,
+                            span: Span::DUMMY,
+                        }],
+                        vec![],
+                        Span::DUMMY,
+                    )
+                };
+                result.push(CStmt::LetSeq(vec![defl], Span::DUMMY));
+            }
+            ImperativeStatement::Let { name, expr } | ImperativeStatement::Equal { name, expr } => {
+                let defl = CDefl::Value(
+                    name,
+                    vec![CClause {
+                        patterns: vec![],
+                        qualifiers: vec![],
+                        body: expr,
+                        span: Span::DUMMY,
+                    }],
+                    vec![],
+                    Span::DUMMY,
+                );
+                result.push(CStmt::LetSeq(vec![defl], Span::DUMMY));
+            }
+            ImperativeStatement::Bind { name, ty, expr } => {
+                let mut name_with_keep = name.clone();
+                name_with_keep.add_prop(bsc_syntax::id::IdProp::Keep);
+                let instance_name_expr = CExpr::Apply(
+                    Box::new(CExpr::Var(Id::qualified("Prelude", "primGetName", Position::unknown()))),
+                    vec![CExpr::Var(name_with_keep.clone())],
+                    Span::DUMMY,
+                );
+
+                if let Some(bind_type) = ty {
+                    result.push(CStmt::BindT {
+                        pattern: CPat::Var(name_with_keep),
+                        instance_name: Some(Box::new(instance_name_expr)),
+                        pragmas: vec![],
+                        ty: CQType {
+                            context: vec![],
+                            ty: bind_type,
+                            span: Span::DUMMY,
+                        },
+                        expr,
+                        span: Span::DUMMY,
+                    });
+                } else {
+                    result.push(CStmt::Bind {
+                        pattern: CPat::Var(name_with_keep),
+                        instance_name: Some(Box::new(instance_name_expr)),
+                        pragmas: vec![],
+                        expr,
+                        span: Span::DUMMY,
+                    });
+                }
+            }
+            ImperativeStatement::Rule { pos, name, guard, body_pos, body } => {
+                let body_stmts = conv_imperative_stmts_to_cstmts(
+                    ImperativeStmtContext::ISCAction,
+                    None,
+                    true,
+                    body,
+                );
+                let name_expr = Some(CExpr::Lit(
+                    Literal::String(name.name().to_string()),
+                    name.position(),
+                ));
+                let qualifiers = if let Some(g) = guard {
+                    vec![CQual::Filter(g)]
+                } else {
+                    vec![]
+                };
+                let rule = CRule::Rule {
+                    pragmas: vec![],
+                    name: name_expr,
+                    qualifiers,
+                    body: CExpr::Action(body_pos, body_stmts),
+                    span: Span::DUMMY,
+                };
+                let rules_expr = CExpr::Apply(
+                    Box::new(CExpr::Var(Id::qualified("Prelude", "addRulesAt", Position::unknown()))),
+                    vec![CExpr::Rules(vec![], vec![rule], Span::DUMMY)],
+                    Span::DUMMY,
+                );
+                result.push(CStmt::Expr {
+                    instance_name: None,
+                    expr: rules_expr,
+                    span: Span::DUMMY,
+                });
+            }
+            ImperativeStatement::MethodDefn { pos, name, ret_type, params, guard, body } => {
+                let is_action = ret_type.as_ref().map(|t| {
+                    if let CType::Con(tycon) = t {
+                        tycon.name() == "Action"
+                    } else {
+                        false
+                    }
+                }).unwrap_or(false);
+
+                let body_expr = if is_action {
+                    let body_stmts = conv_imperative_stmts_to_cstmts(
+                        ImperativeStmtContext::ISCAction,
+                        None,
+                        true,
+                        body,
+                    );
+                    CExpr::Action(pos, body_stmts)
+                } else {
+                    convert_stmts_to_expr(body)
+                };
+
+                let patterns: Vec<CPat> = params.iter().map(|(n, _)| CPat::Var(n.clone())).collect();
+                let qualifiers = guard.map(|g| vec![CQual::Filter(g)]).unwrap_or_default();
+                let method_type = build_method_type(&params, ret_type);
+
+                let method_field = CField {
+                    name,
+                    pragmas: None,
+                    ty: CQType {
+                        context: vec![],
+                        ty: method_type,
+                        span: Span::DUMMY,
+                    },
+                    default: vec![CClause {
+                        patterns,
+                        qualifiers,
+                        body: body_expr,
+                        span: Span::DUMMY,
+                    }],
+                    orig_type: None,
+                    span: Span::DUMMY,
+                };
+
+                let defl = CDefl::Value(
+                    method_field.name.clone(),
+                    method_field.default.clone(),
+                    vec![],
+                    Span::DUMMY,
+                );
+                result.push(CStmt::LetSeq(vec![defl], Span::DUMMY));
+            }
+            ImperativeStatement::Return { pos, expr } => {
+                let return_expr = CExpr::Apply(
+                    Box::new(CExpr::Var(Id::qualified("Prelude", "return", Position::unknown()))),
+                    vec![expr.unwrap_or_else(|| CExpr::Con(
+                        Id::qualified("Prelude", "()", Position::unknown()),
+                        vec![],
+                        Span::DUMMY,
+                    ))],
+                    Span::DUMMY,
+                );
+                result.push(CStmt::Expr {
+                    instance_name: None,
+                    expr: return_expr,
+                    span: Span::DUMMY,
+                });
+            }
+            ImperativeStatement::NakedExpr(expr) => {
+                result.push(CStmt::Expr {
+                    instance_name: None,
+                    expr,
+                    span: Span::DUMMY,
+                });
+            }
+            ImperativeStatement::If { pos, cond, then_branch, else_branch } => {
+                let then_stmts = conv_imperative_stmts_to_cstmts(context, ifc_type.clone(), stmt_at_end, then_branch);
+                let else_stmts = conv_imperative_stmts_to_cstmts(
+                    context,
+                    ifc_type.clone(),
+                    stmt_at_end,
+                    else_branch.unwrap_or_default(),
+                );
+                let if_expr = if context == ImperativeStmtContext::ISCAction {
+                    CExpr::If(
+                        pos.clone(),
+                        Box::new(cond),
+                        Box::new(CExpr::Action(pos.clone(), then_stmts)),
+                        Box::new(CExpr::Action(pos, else_stmts)),
+                    )
+                } else {
+                    CExpr::If(
+                        pos,
+                        Box::new(cond),
+                        Box::new(CExpr::Do { recursive: false, stmts: then_stmts, span: Span::DUMMY }),
+                        Box::new(CExpr::Do { recursive: false, stmts: else_stmts, span: Span::DUMMY }),
+                    )
+                };
+                result.push(CStmt::Expr {
+                    instance_name: None,
+                    expr: if_expr,
+                    span: Span::DUMMY,
+                });
+            }
+            ImperativeStatement::InterfaceExpr { ty, members } => {
+                let ifc_id = ty.as_ref().and_then(left_con);
+                let defls = convert_interface_members_to_defls(members);
+                let ifc_expr = CExpr::Interface(Position::unknown(), ifc_id, defls);
+                let return_expr = CExpr::Apply(
+                    Box::new(CExpr::Var(Id::qualified("Prelude", "return", Position::unknown()))),
+                    vec![ifc_expr],
+                    Span::DUMMY,
+                );
+                result.push(CStmt::Expr {
+                    instance_name: None,
+                    expr: return_expr,
+                    span: Span::DUMMY,
+                });
+            }
+            ImperativeStatement::BeginEnd { pos, stmts: inner } => {
+                let inner_stmts = conv_imperative_stmts_to_cstmts(context, ifc_type.clone(), stmt_at_end, inner);
+                if context == ImperativeStmtContext::ISCAction {
+                    result.push(CStmt::Expr {
+                        instance_name: None,
+                        expr: CExpr::Action(pos, inner_stmts),
+                        span: Span::DUMMY,
+                    });
+                } else {
+                    result.push(CStmt::Expr {
+                        instance_name: None,
+                        expr: CExpr::Do { recursive: false, stmts: inner_stmts, span: Span::DUMMY },
+                        span: Span::DUMMY,
+                    });
+                }
+            }
+            ImperativeStatement::Action { pos, stmts: inner } => {
+                let inner_stmts = conv_imperative_stmts_to_cstmts(ImperativeStmtContext::ISCAction, None, true, inner);
+                result.push(CStmt::Expr {
+                    instance_name: None,
+                    expr: CExpr::Action(pos, inner_stmts),
+                    span: Span::DUMMY,
+                });
+            }
+            ImperativeStatement::RegWrite { lhs, rhs } => {
+                let write_expr = CExpr::Write {
+                    position: Position::unknown(),
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span: Span::DUMMY,
+                };
+                result.push(CStmt::Expr {
+                    instance_name: None,
+                    expr: write_expr,
+                    span: Span::DUMMY,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    result
+}
+
+fn build_method_type(params: &[(Id, Option<CType>)], ret_type: Option<CType>) -> CType {
+    let base_type = ret_type.unwrap_or_else(|| {
+        CType::Var(Id::new(SmolStr::new_static("_"), Position::unknown()))
+    });
+    let param_types: Vec<CType> = params.iter()
+        .map(|(_, t)| t.clone().unwrap_or_else(|| {
+            CType::Var(Id::new(SmolStr::new_static("_"), Position::unknown()))
+        }))
+        .collect();
+
+    if param_types.is_empty() {
+        base_type
+    } else {
+        param_types.into_iter().rev().fold(base_type, |acc, param_ty| {
+            CType::Fun(Box::new(param_ty), Box::new(acc), Span::DUMMY)
+        })
+    }
+}
+
+fn convert_interface_members_to_defls(members: Vec<ImperativeStatement>) -> Vec<CDefl> {
+    let mut defls = Vec::new();
+    for member in members {
+        match member {
+            ImperativeStatement::MethodDefn { name, params, body, guard, .. } => {
+                let body_expr = convert_stmts_to_expr(body);
+                let patterns: Vec<CPat> = params.iter().map(|(n, _)| CPat::Var(n.clone())).collect();
+                let qualifiers = guard.map(|g| vec![CQual::Filter(g)]).unwrap_or_default();
+                let clause = CClause {
+                    patterns,
+                    qualifiers,
+                    body: body_expr,
+                    span: Span::DUMMY,
+                };
+                defls.push(CDefl::Value(name, vec![clause], vec![], Span::DUMMY));
+            }
+            ImperativeStatement::SubinterfaceMethod { name, expr, .. } => {
+                let clause = CClause {
+                    patterns: vec![],
+                    qualifiers: vec![],
+                    body: expr,
+                    span: Span::DUMMY,
+                };
+                defls.push(CDefl::Value(name, vec![clause], vec![], Span::DUMMY));
+            }
+            _ => {}
+        }
+    }
+    defls
+}
+
+pub fn cstmts_to_cm_stmts(schedule_pragmas: Vec<CSchedulePragma>, cstmts: Vec<CStmt>) -> Vec<CModuleItem> {
+    if cstmts.is_empty() {
+        return vec![];
+    }
+
+    let len = cstmts.len();
+    let (init_stmts, last_stmt) = cstmts.split_at(len - 1);
+
+    let mut result: Vec<CModuleItem> = init_stmts.iter().cloned().map(CModuleItem::Stmt).collect();
+
+    if !schedule_pragmas.is_empty() {
+        let add_rules = CExpr::Apply(
+            Box::new(CExpr::Var(Id::qualified("Prelude", "addRulesAt", Position::unknown()))),
+            vec![CExpr::Rules(schedule_pragmas, vec![], Span::DUMMY)],
+            Span::DUMMY,
+        );
+        result.push(CModuleItem::Stmt(CStmt::Expr {
+            instance_name: None,
+            expr: add_rules,
+            span: Span::DUMMY,
+        }));
+    }
+
+    match &last_stmt[0] {
+        CStmt::Expr { expr: CExpr::Apply(func, args, _), .. } => {
+            if args.len() == 1 {
+                if let CExpr::Interface(position, name, fields) = &args[0] {
+                    result.push(CModuleItem::Interface(CExpr::Interface(
+                        position.clone(),
+                        name.clone(),
+                        fields.clone(),
+                    )));
+                    return result;
+                }
+            }
+            result.push(CModuleItem::Stmt(last_stmt[0].clone()));
+        }
+        CStmt::Expr { expr, .. } => {
+            result.push(CModuleItem::Stmt(last_stmt[0].clone()));
+        }
+        _ => {
+            result.push(CModuleItem::Stmt(last_stmt[0].clone()));
+        }
+    }
+
+    result
+}
+
+pub fn build_module_body_expr(pos: Position, ifc_type: Option<CType>, stmts: Vec<ImperativeStatement>) -> CExpr {
+    let cstmts = imperative_to_cstmts(ImperativeStmtContext::ISCIsModule, ifc_type, stmts);
+    let cm_stmts = cstmts_to_cm_stmts(vec![], cstmts);
+    CExpr::Module(pos, cm_stmts)
+}
+
+fn left_con(ty: &CType) -> Option<Id> {
+    match ty {
+        CType::Con(id) => Some(id.clone()),
+        CType::Apply(left, _, _) => left_con(left),
+        _ => None,
+    }
 }

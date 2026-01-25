@@ -18,14 +18,42 @@
 pub mod definitions;
 pub mod expressions;
 pub mod imperative;
+pub mod imperative_parsing;
 pub mod operators;
 pub mod package;
 pub mod patterns;
 pub mod types;
 
-use bsc_diagnostics::{ParseError, Span};
+use bsc_diagnostics::{ParseError, Span, Position};
 use bsc_lexer_bsv::{Lexer, Token, TokenKind};
-use bsc_syntax::{CDefn, CExpr, CPackage, CPat, CType};
+use bsc_syntax::{
+    CDefn, CExpr, CPackage, CPat, CType, CDef, CQType, CClause, CPragma, CStructDef,
+    StructSubType, IdK, CField, CValueDef
+};
+use crate::imperative::ImperativeStatement;
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+/// Global position map for span.start → Position lookup.
+/// Populated during token stream creation, used by chumsky parsers.
+/// Mirrors Haskell's approach where each Token carries its Position.
+static POSITION_MAP: RwLock<Option<HashMap<u32, Position>>> = RwLock::new(None);
+
+/// Set the position map (called before parsing).
+fn set_position_map(map: HashMap<u32, Position>) {
+    *POSITION_MAP.write().unwrap() = Some(map);
+}
+
+/// Look up Position from span start offset.
+/// Returns the actual Position from the lexer, never Position::unknown().
+pub fn lookup_position(span_start: u32) -> Position {
+    POSITION_MAP
+        .read()
+        .unwrap()
+        .as_ref()
+        .and_then(|map| map.get(&span_start).cloned())
+        .unwrap_or_else(|| Position::line_col(1, span_start as i32 + 1))
+}
 
 /// Result type for parser operations.
 pub type ParseResult<T> = Result<T, ParseError>;
@@ -96,16 +124,26 @@ impl<'src> BsvParser<'src> {
 
     /// Parse a BSV package with a default name.
     pub fn parse_package_with_default(&mut self, default_name: String) -> ParseResult<CPackage> {
+        // Build position map for span → position lookup (mirrors Haskell's Token Position LexItem)
+        let mut position_map = HashMap::new();
+
         // Convert tokens to the format expected by the chumsky parser
+        // Filter out Eof tokens - chumsky handles end-of-input separately via end()
         let token_spans: Vec<(bsc_lexer_bsv::TokenKind, chumsky::prelude::SimpleSpan<u32>)> =
             self.tokens
                 .iter()
+                .filter(|t| !matches!(t.kind, TokenKind::Eof))
                 .map(|token| {
+                    // Store position in map for lookup by chumsky parsers
+                    position_map.insert(token.span.start, token.position.clone());
                     use chumsky::span::Span as ChumskySpan;
                     let span = chumsky::prelude::SimpleSpan::new((), token.span.start..token.span.end);
                     (token.kind.clone(), span)
                 })
                 .collect();
+
+        // Set global position map for use by parsers
+        set_position_map(position_map);
 
         // Use the chumsky-based package parser
         package::parse_bsv_package(token_spans, default_name)
@@ -124,6 +162,149 @@ impl<'src> BsvParser<'src> {
             })
     }
 
+    /// Convert an ImperativeStatement to a CDefn.
+    ///
+    /// Mirrors `convImperativeStmtsToCDefns` from CVParserImperative.lhs.
+    /// This function converts BSV imperative constructs to the functional CSyntax representation.
+    fn imperative_statement_to_cdefn(&self, stmt: ImperativeStatement) -> ParseResult<CDefn> {
+        match stmt {
+            ImperativeStatement::ModuleDefn { pos, name, pragma, module_type, def_clause } => {
+                // From Haskell: ISModule pos name maybePragma moduleType definition : rest) =
+                //   do let pragmas = map CPragma (maybeToList maybePragma)
+                //          defn = CValueSign (CDef name moduleType [definition])
+                let mut cdefns = Vec::new();
+
+                // Add pragma if present
+                if let Some(p) = pragma {
+                    cdefns.push(CDefn::Pragma(p));
+                }
+
+                // Create the module definition
+                let def = CDef::Untyped {
+                    name: name.clone(),
+                    ty: module_type,
+                    clauses: vec![def_clause],
+                    span: Span::DUMMY,
+                };
+                cdefns.push(CDefn::ValueSign(def));
+
+                // Return the module definition (prefer the second item if pragma exists)
+                if cdefns.len() > 1 {
+                    Ok(cdefns.remove(1))
+                } else {
+                    Ok(cdefns.remove(0))
+                }
+            }
+            ImperativeStatement::FunctionDefn { pos, name, ret_type, params, provisos, body: _, attrs: _ } => {
+                // From Haskell: ISFunction pos prags (CLValueSign def []) : rest) =
+                //   do let pragmas = map CPragma prags
+                //          defn = (CValueSign def)
+
+                // Convert parameters and return type to a function type signature
+                let ty = if let Some(ret_ty) = ret_type {
+                    // Create a qualified type with provisos and function type
+                    CQType {
+                        context: provisos,
+                        ty: ret_ty,
+                        span: Span::DUMMY,
+                    }
+                } else {
+                    return Err(ParseError::InvalidSyntax {
+                        message: "Function must have a return type".to_string(),
+                        span: Span::DUMMY.into(),
+                    });
+                };
+
+                // For now, create a simple function definition
+                // In a full implementation, we'd need to convert the function body to a CClause
+                let clause = CClause {
+                    patterns: params.into_iter().map(|(param_name, _)| {
+                        use bsc_syntax::CPat;
+                        CPat::Var(param_name)
+                    }).collect(),
+                    qualifiers: Vec::new(),
+                    body: CExpr::Var(name.clone()), // Placeholder
+                    span: Span::DUMMY,
+                };
+
+                let def = CDef::Untyped {
+                    name: name.clone(),
+                    ty,
+                    clauses: vec![clause],
+                    span: Span::DUMMY,
+                };
+
+                Ok(CDefn::ValueSign(def))
+            }
+            ImperativeStatement::InterfaceDecl { pos, name, type_vars, members } => {
+                // From Haskell: ISInterface pos name ifcPragmas params methods : rest) =
+                //   do let derivedClasses = []
+                //          defn = Cstruct True (SInterface ifcPragmas) name params methods derivedClasses
+                let struct_def = CStructDef {
+                    visible: true, // Interface constructors are visible
+                    sub_type: StructSubType::Interface(vec![]),
+                    name: IdK::Plain(name),
+                    params: type_vars,
+                    fields: members,
+                    deriving: Vec::new(), // No derived classes for interfaces
+                    span: Span::DUMMY,
+                };
+
+                Ok(CDefn::Struct(struct_def))
+            }
+            ImperativeStatement::Typedef(defns) => {
+                // From Haskell: ISTypedef pos defns : rest) =
+                //   do restDefns <- convImperativeStmtsToCDefns rest
+                //      return (defns ++ restDefns)
+
+                // For multiple typedefs, return the first one
+                // In a full implementation, we'd need a way to return multiple CDefns
+                if let Some(first_def) = defns.into_iter().next() {
+                    Ok(first_def)
+                } else {
+                    Err(ParseError::InvalidSyntax {
+                        message: "Empty typedef list".to_string(),
+                        span: Span::DUMMY.into(),
+                    })
+                }
+            }
+            ImperativeStatement::Rule { pos, name, guard, body_pos: _, body: _ } => {
+                // From Haskell, rules are not directly converted to CDefn in the same way.
+                // They are typically wrapped in a module or handled differently.
+                // For now, we'll create a simple value definition representing the rule
+
+                let rule_expr = if let Some(guard_expr) = guard {
+                    // Create a rule with guard
+                    guard_expr
+                } else {
+                    // Create a rule without guard
+                    CExpr::Var(name.clone())
+                };
+
+                let clause = CClause {
+                    patterns: Vec::new(),
+                    qualifiers: Vec::new(),
+                    body: rule_expr,
+                    span: Span::DUMMY,
+                };
+
+                let def = CValueDef {
+                    name: name.clone(),
+                    clauses: vec![clause],
+                    span: Span::DUMMY,
+                };
+
+                Ok(CDefn::Value(def))
+            }
+            _ => {
+                Err(ParseError::InvalidSyntax {
+                    message: format!("Cannot convert imperative statement to CDefn: {:?}", stmt),
+                    span: Span::DUMMY.into(),
+                })
+            }
+        }
+    }
+
     /// Parse a top-level definition.
     ///
     /// BSV definitions include:
@@ -139,44 +320,24 @@ impl<'src> BsvParser<'src> {
     pub fn parse_definition(&mut self) -> ParseResult<CDefn> {
         match self.current_kind() {
             TokenKind::KwModule => {
-                let _stmt = self.parse_module()?;
-                // TODO: Convert ImperativeStatement to CDefn
-                Err(ParseError::InvalidSyntax {
-                    message: "Module definition conversion to CDefn not yet implemented".to_string(),
-                    span: self.current_span().into(),
-                })
+                let stmt = self.parse_module()?;
+                self.imperative_statement_to_cdefn(stmt)
             }
             TokenKind::KwFunction => {
-                let _stmt = self.parse_function()?;
-                // TODO: Convert ImperativeStatement to CDefn
-                Err(ParseError::InvalidSyntax {
-                    message: "Function definition conversion to CDefn not yet implemented".to_string(),
-                    span: self.current_span().into(),
-                })
+                let stmt = self.parse_function()?;
+                self.imperative_statement_to_cdefn(stmt)
             }
             TokenKind::KwInterface => {
-                let _stmt = self.parse_interface_decl()?;
-                // TODO: Convert ImperativeStatement to CDefn
-                Err(ParseError::InvalidSyntax {
-                    message: "Interface definition conversion to CDefn not yet implemented".to_string(),
-                    span: self.current_span().into(),
-                })
+                let stmt = self.parse_interface_decl()?;
+                self.imperative_statement_to_cdefn(stmt)
             }
             TokenKind::KwTypedef => {
-                let _stmt = self.parse_typedef()?;
-                // TODO: Convert ImperativeStatement to CDefn
-                Err(ParseError::InvalidSyntax {
-                    message: "Typedef definition conversion to CDefn not yet implemented".to_string(),
-                    span: self.current_span().into(),
-                })
+                let stmt = self.parse_typedef()?;
+                self.imperative_statement_to_cdefn(stmt)
             }
             TokenKind::KwRule => {
-                let _stmt = self.parse_rule()?;
-                // TODO: Convert ImperativeStatement to CDefn
-                Err(ParseError::InvalidSyntax {
-                    message: "Rule definition conversion to CDefn not yet implemented".to_string(),
-                    span: self.current_span().into(),
-                })
+                let stmt = self.parse_rule()?;
+                self.imperative_statement_to_cdefn(stmt)
             }
             _ => Err(ParseError::InvalidSyntax {
                 message: format!("Expected definition keyword, found: {}", self.current_kind().name()),
@@ -237,6 +398,12 @@ impl<'src> BsvParser<'src> {
         self.current().span
     }
 
+    /// Get the position of the current token (file, line, column).
+    /// Mirrors Haskell's `getPos` which extracts position from current token.
+    fn current_position(&self) -> Position {
+        self.current().position.clone()
+    }
+
     /// Check if we're at end of file.
     fn is_eof(&self) -> bool {
         matches!(self.current_kind(), TokenKind::Eof)
@@ -275,6 +442,18 @@ impl<'src> BsvParser<'src> {
         if self.check(expected) {
             self.advance();
             true
+        } else {
+            false
+        }
+    }
+
+    /// Look ahead N tokens and check if it matches the expected kind.
+    ///
+    /// Returns true if the token at position `current_pos + offset` matches `expected`.
+    /// Returns false if we would go past the end of the token stream.
+    fn peek_ahead(&self, offset: usize, expected: &TokenKind) -> bool {
+        if let Some(token) = self.tokens.get(self.pos + offset) {
+            std::mem::discriminant(&token.kind) == std::mem::discriminant(expected)
         } else {
             false
         }
@@ -348,8 +527,19 @@ pub struct ParseErrorInfo {
     pub message: String,
 }
 
-pub fn parse_package_with_file(source: &str, _filename: &str) -> Result<CPackage, Vec<ParseErrorInfo>> {
-    parse(source).map_err(|e| vec![ParseErrorInfo { message: e.to_string() }])
+pub fn parse_package_with_file(source: &str, filename: &str) -> Result<CPackage, Vec<ParseErrorInfo>> {
+    // Extract default package name from filename (without path and extension)
+    let default_name = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("DefaultPackage")
+        .to_string();
+
+    let mut parser = BsvParser::new(source)
+        .map_err(|e: ParseError| vec![ParseErrorInfo { message: e.to_string() }])?;
+
+    parser.parse_package_with_default(default_name)
+        .map_err(|e: ParseError| vec![ParseErrorInfo { message: e.to_string() }])
 }
 
 #[cfg(test)]

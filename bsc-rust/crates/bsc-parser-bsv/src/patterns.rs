@@ -208,11 +208,11 @@ impl<'src> BsvParser<'src> {
     /// - `Constructor .var`                     -- variable binding
     /// - `Constructor`                          -- no arguments
     fn parse_constructor_pattern_with(&mut self, constr: Id, _tagged: bool) -> ParseResult<CPat> {
-        let _pos = self.current_span().start;
+        let pos = self.span_to_position(self.current_span());
 
         // Try: Constructor { ... } (braced patterns)
         if self.check(&TokenKind::SymLBrace) {
-            return self.parse_constructor_fields_or_tuple_pattern_with(Position::unknown(), constr);
+            return self.parse_constructor_fields_or_tuple_pattern_with(pos, constr);
         }
 
         // Try: Constructor pattern (single pattern argument)
@@ -327,7 +327,7 @@ impl<'src> BsvParser<'src> {
     ///
     /// Grammar: `{ pattern1, pattern2, ... }`
     fn parse_tuple_pattern(&mut self) -> ParseResult<CPat> {
-        let pos = Position::unknown();
+        let pos = self.span_to_position(self.current_span());
         self.parse_tuple_pattern_with(pos)
     }
 
@@ -343,7 +343,7 @@ impl<'src> BsvParser<'src> {
     ///
     /// Corresponds to `pWildcardPattern` in CVParser.lhs line 2788.
     fn parse_wildcard_pattern(&mut self) -> ParseResult<CPat> {
-        let pos = Position::line_col(-1, -1); // TODO: Convert from span properly
+        let pos = self.span_to_position(self.current_span());
         self.expect(&TokenKind::SymDotStar)?;
         Ok(CPat::Wildcard(pos))
     }
@@ -367,9 +367,10 @@ impl<'src> BsvParser<'src> {
     fn parse_numeric_literal_pattern(&mut self) -> ParseResult<CPat> {
         let token = self.advance();
         let token_span = token.span;
+        let token_pos = token.position.clone();
         match &token.kind {
             TokenKind::Number { value, bitwidth, base, .. } => {
-                let pos = Position::unknown();
+                let pos = token_pos;
 
                 match value {
                     bsc_lexer_bsv::SvNumber::Integer(num) => {
@@ -423,7 +424,7 @@ impl<'src> BsvParser<'src> {
                 }
             },
             TokenKind::Integer { size: _, base, value } => {
-                let pos = Position::unknown();
+                let pos = token_pos.clone();
                 let int_lit = IntLiteral {
                     width: None,
                     base: match base {
@@ -446,8 +447,10 @@ impl<'src> BsvParser<'src> {
     /// Corresponds to `pStringLiteralPattern` in CVParser.lhs line 2772.
     fn parse_string_literal_pattern(&mut self) -> ParseResult<CPat> {
         let token = self.advance();
+        let token_span = token.span;
+        let token_pos = token.position.clone();
         if let TokenKind::String(s) = &token.kind {
-            let pos = Position::unknown();
+            let pos = token_pos;
             Ok(CPat::Lit(Literal::String(s.clone()), pos))
         } else {
             let span = token.span;
@@ -512,20 +515,38 @@ impl<'src> BsvParser<'src> {
 
     /// Check if the content inside braces looks like a tuple pattern.
     ///
-    /// This is a heuristic - tuple patterns contain patterns that don't start
-    /// with identifiers (since identifiers would be field names).
+    /// This is a heuristic based on the Haskell logic in CVParser.lhs:
+    /// - Field patterns: `fieldname: pattern` (struct pattern)
+    /// - Tuple patterns: patterns without field names
+    ///
+    /// The key insight from Haskell: "patterns in tuples can't start with identifiers"
+    /// because identifiers would be field names in struct patterns.
     fn is_tuple_pattern_content(&self) -> bool {
-        // Look ahead to see if we have patterns (not field patterns)
-        // This is a simplified heuristic
-        !self.check(&TokenKind::Id(smol_str::SmolStr::new_static(""))) ||
-        self.check(&TokenKind::SymDot) ||
-        self.check(&TokenKind::SymDotStar)
+        // Check if we have a field pattern: `identifier :`
+        if let TokenKind::Id(_) = self.current_kind() {
+            // Look ahead to see if it's followed by a colon
+            // If yes, it's a field pattern (struct), not a tuple
+            return !self.peek_ahead(1, &TokenKind::SymColon);
+        }
+
+        // If it's not an identifier, then it could be a tuple pattern
+        // These can start tuple patterns:
+        // - .identifier (pattern variable)
+        // - .* (wildcard)
+        // - tagged (tagged union pattern)
+        // - literals (numeric/string patterns)
+        // - ( (parenthesized pattern)
+        // - { (nested tuple pattern)
+        // - Constructor (constructor without fields)
+        true
     }
+
 
     /// Parse an identifier (for patterns, fields, etc.).
     fn parse_identifier(&mut self) -> ParseResult<Id> {
         if let TokenKind::Id(name) = &self.current_kind() {
-            let id = Id::unpositioned(name.clone());
+            let pos = self.span_to_position(self.current_span());
+            let id = Id::new(name.clone(), pos);
             self.advance();
             Ok(id)
         } else {
@@ -534,10 +555,39 @@ impl<'src> BsvParser<'src> {
     }
 
     /// Parse a qualified constructor name.
+    ///
+    /// Corresponds to `pQualConstructor` in CVParser.lhs line 438.
+    ///
+    /// Supports qualified names like `Module::Constructor` as well as simple constructors.
     fn parse_qualified_constructor(&mut self) -> ParseResult<Id> {
-        // For now, just parse a simple identifier
-        // TODO: Handle qualified names like Module::Constructor
-        self.parse_identifier()
+        let pos = self.span_to_position(self.current_span());
+
+        // Try to parse qualified name first: Package::Constructor
+        if let TokenKind::Id(first_name) = &self.current_kind() {
+            let first_name = first_name.clone();
+            self.advance();
+
+            // Check if the next token is `::`
+            if self.check(&TokenKind::SymColonColon) {
+                self.advance(); // consume `::`
+
+                // Parse the constructor name after `::`
+                if let TokenKind::Id(constructor_name) = &self.current_kind() {
+                    let constructor_name = constructor_name.clone();
+                    self.advance();
+
+                    // Create qualified identifier: Package::Constructor
+                    return Ok(Id::qualified(first_name.as_str(), constructor_name, pos));
+                } else {
+                    return Err(self.error("constructor name after ::"));
+                }
+            } else {
+                // No `::`, so it's just a simple constructor name
+                return Ok(Id::new(first_name, pos));
+            }
+        } else {
+            Err(self.error("constructor name"))
+        }
     }
 
     /// Parse comma-separated items within braces.
@@ -631,6 +681,18 @@ impl<'src> BsvParser<'src> {
             message: message.to_string(),
             span: span.into(),
         }
+    }
+
+    /// Convert a Span to Position by finding the token with matching span.
+    ///
+    /// This mirrors Haskell's approach where each token carries its Position.
+    /// We look up the token with the matching span.start to get its Position.
+    fn span_to_position(&self, span: Span) -> Position {
+        self.tokens
+            .iter()
+            .find(|t| t.span.start == span.start)
+            .map(|t| t.position.clone())
+            .unwrap_or_else(Position::unknown)
     }
 }
 

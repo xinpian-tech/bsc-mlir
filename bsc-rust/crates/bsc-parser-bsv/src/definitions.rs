@@ -118,17 +118,56 @@ impl<'src> BsvParser<'src> {
 
         self.expect(&TokenKind::KwEndmodule)?;
 
-        let pos = Position::unknown();
+        use crate::imperative::build_module_body_expr;
+        use smol_str::SmolStr;
+        let pos = Position::new("<unknown>", start_pos as i32, start_pos as i32);
+
+        let m_tyvar = CType::Var(Id::new(SmolStr::new_static("_m__"), Position::unknown()));
+        let c_tyvar = CType::Var(Id::new(SmolStr::new_static("_c__"), Position::unknown()));
+        let result_type = CType::Apply(
+            Box::new(m_tyvar.clone()),
+            Box::new(ifc_type.clone()),
+            Span::DUMMY,
+        );
+
+        let param_types: Vec<CType> = params.iter().map(|(_, t, _)| t.clone()).collect();
+        let full_type = if param_types.is_empty() {
+            result_type
+        } else {
+            param_types.into_iter().rev().fold(result_type, |acc, param_ty| {
+                CType::Fun(Box::new(param_ty), Box::new(acc), Span::DUMMY)
+            })
+        };
+
+        let is_module_pred = CPred {
+            class: Id::qualified("Prelude", "IsModule", Position::unknown()),
+            args: vec![m_tyvar, c_tyvar],
+            span: Span::DUMMY,
+        };
+        let mut all_context = vec![is_module_pred];
+        all_context.extend(provisos);
+
+        let module_type = CQType {
+            context: all_context,
+            ty: full_type,
+            span: Span::DUMMY,
+        };
+
+        let body_expr = build_module_body_expr(pos.clone(), Some(ifc_type), body);
+        let patterns: Vec<CPat> = params.into_iter().map(|(n, _, _)| CPat::Var(n)).collect();
+        let def_clause = CClause {
+            patterns,
+            qualifiers: vec![],
+            body: body_expr,
+            span: Span::DUMMY,
+        };
 
         Ok(ImperativeStatement::ModuleDefn {
             pos,
             name,
-            params,
-            ret_type: None, // BSV modules don't have explicit return types
-            ifc_type: Some(ifc_type),
-            provisos,
-            body,
-            attrs: Vec::new(), // TODO: Parse attributes
+            pragma: None,
+            module_type,
+            def_clause,
         })
     }
 
@@ -225,7 +264,7 @@ impl<'src> BsvParser<'src> {
 
         self.expect(&TokenKind::KwEndfunction)?;
 
-        let pos = Position::unknown();
+        let pos = Position::new("<unknown>", start_pos as i32, start_pos as i32);
 
         Ok(ImperativeStatement::FunctionDefn {
             pos,
@@ -234,7 +273,7 @@ impl<'src> BsvParser<'src> {
             params,
             provisos,
             body,
-            attrs: Vec::new(), // TODO: Parse attributes
+            attrs: Vec::new(), // Attributes would be parsed from function attributes if available
         })
     }
 
@@ -336,7 +375,7 @@ impl<'src> BsvParser<'src> {
 
         self.expect(&TokenKind::KwEndinterface)?;
 
-        let pos = Position::unknown();
+        let pos = Position::new("<unknown>", start_pos as i32, start_pos as i32);
 
         Ok(ImperativeStatement::InterfaceDecl {
             pos,
@@ -354,7 +393,7 @@ impl<'src> BsvParser<'src> {
         let name = self.parse_def_identifier()?;
 
         self.expect(&TokenKind::SymLParen)?;
-        let _args = if self.check(&TokenKind::SymRParen) {
+        let args = if self.check(&TokenKind::SymRParen) {
             Vec::new()
         } else {
             self.parse_comma_separated(Self::parse_function_arg)?
@@ -362,15 +401,36 @@ impl<'src> BsvParser<'src> {
         self.expect(&TokenKind::SymRParen)?;
         self.expect(&TokenKind::SymSemi)?;
 
-        // Convert to CField representation
-        // TODO: Properly construct method type with arguments
+        // Construct method type with arguments: foldr fn rettype argtypes
+        // This mirrors the Haskell `foldr fn rettype argtypes` pattern
+        let arg_types: Vec<CType> = args.iter()
+            .filter_map(|(_, ty_opt)| ty_opt.clone())
+            .collect();
+
+        let method_type = if arg_types.is_empty() {
+            ret_type
+        } else {
+            // Build function type: arg1 -> arg2 -> ... -> rettype
+            arg_types.into_iter().rev().fold(ret_type, |acc, arg_type| {
+                CType::Fun(Box::new(arg_type), Box::new(acc), Span::DUMMY)
+            })
+        };
+
+        // Extract argument names for pragmas
+        let arg_names: Vec<Id> = args.iter().map(|(name, _)| name.clone()).collect();
+        let pragmas = if arg_names.is_empty() {
+            None
+        } else {
+            Some(vec![IfcPragma::ArgNames(arg_names)])
+        };
+
         Ok(CField {
             name,
-            pragmas: None,
+            pragmas,
             orig_type: None,
             ty: CQType {
                 context: Vec::new(),
-                ty: ret_type,
+                ty: method_type,
                 span: Span::DUMMY,
             },
             default: Vec::new(),
@@ -446,41 +506,209 @@ impl<'src> BsvParser<'src> {
         self.expect(&TokenKind::Id("enum".into()))?;
 
         self.expect(&TokenKind::SymLBrace)?;
-        let _enum_tags = self.parse_enum_tags()?;
+        let enum_tags = self.parse_enum_tags()?;
         self.expect(&TokenKind::SymRBrace)?;
 
         let name = self.parse_constructor()?;
-        let _derivs = self.parse_derivations()?;
+        let derivs = self.parse_derivations()?;
         self.expect(&TokenKind::SymSemi)?;
 
-        // TODO: Implement complete enum construction
-        // For now, return a placeholder
-        Ok(CDefn::Type(CTypeDef {
-            name: IdK::Plain(name.clone()),
+        // Create summands for each enum tag
+        // Each tag becomes a constructor with no arguments (Unit type)
+        let mut original_summands = Vec::new();
+        let mut internal_summands = Vec::new();
+
+        for (tag_name, tag_encoding) in enum_tags {
+            // Original summand: no arguments, just the tag name
+            original_summands.push(COriginalSummand {
+                names: vec![tag_name.clone()],
+                arg_types: Vec::new(),
+                field_names: None,
+                tag_encoding,
+            });
+
+            // Internal summand: single Unit type argument, actual encoding
+            internal_summands.push(CInternalSummand {
+                names: vec![tag_name],
+                arg_type: CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown())),
+                tag_encoding: tag_encoding.unwrap_or(0), // Use 0 if no encoding specified
+            });
+        }
+
+        Ok(CDefn::Data(CDataDef {
+            visible: true,
+            name: IdK::Plain(name),
             params: Vec::new(),
-            body: CType::Con(name), // Placeholder
+            original_summands,
+            internal_summands,
+            deriving: derivs,
             span: Span::DUMMY,
         }))
     }
 
     /// Parse a struct typedef: `typedef struct { ... } StructName;`
     fn parse_typedef_struct(&mut self) -> crate::ParseResult<Vec<CDefn>> {
-        // TODO: Implement struct parsing
-        // This is complex and requires parsing struct fields
-        Err(ParseError::InvalidSyntax {
-            message: "Struct typedef parsing not yet implemented".to_string(),
-            span: self.current_span().into(),
-        })
+        self.expect(&TokenKind::Id("struct".into()))?;
+
+        self.expect(&TokenKind::SymLBrace)?;
+        let fields = self.parse_struct_fields()?;
+        self.expect(&TokenKind::SymRBrace)?;
+
+        let name = self.parse_constructor()?;
+
+        // Parse optional type parameters after the struct name
+        let params = if self.eat(&TokenKind::SymHash) {
+            self.expect(&TokenKind::SymLParen)?;
+            let type_params = self.parse_comma_separated(Self::parse_type_param)?;
+            self.expect(&TokenKind::SymRParen)?;
+            type_params.into_iter().map(|(id, _)| id).collect()
+        } else {
+            Vec::new()
+        };
+
+        let derivs = self.parse_derivations()?;
+        self.expect(&TokenKind::SymSemi)?;
+
+        // Convert (Id, CType) pairs to CField structs
+        let cfields: Vec<CField> = fields
+            .into_iter()
+            .map(|(field_name, field_type)| CField {
+                name: field_name,
+                pragmas: None,
+                orig_type: None,
+                ty: CQType {
+                    context: Vec::new(),
+                    ty: field_type,
+                    span: Span::DUMMY,
+                },
+                default: Vec::new(),
+                span: Span::DUMMY,
+            })
+            .collect();
+
+        // Create CDefn::Struct with StructSubType::Struct
+        let struct_def = CDefn::Struct(CStructDef {
+            visible: true,
+            sub_type: StructSubType::Struct,
+            name: IdK::Plain(name),
+            params,
+            fields: cfields,
+            deriving: derivs,
+            span: Span::DUMMY,
+        });
+
+        Ok(vec![struct_def])
+    }
+
+    /// Parse struct fields: `Type field1; Type field2; ...`
+    fn parse_struct_fields(&mut self) -> crate::ParseResult<Vec<(Id, CType)>> {
+        let mut fields = Vec::new();
+
+        while !self.check(&TokenKind::SymRBrace) && !self.is_eof() {
+            let field_type = self.parse_type_expr()?;
+            let field_name = self.parse_def_identifier()?;
+            self.expect(&TokenKind::SymSemi)?;
+            fields.push((field_name, field_type));
+        }
+
+        Ok(fields)
     }
 
     /// Parse a tagged union typedef: `typedef union tagged { ... } UnionName;`
     fn parse_typedef_tagged_union(&mut self) -> crate::ParseResult<Vec<CDefn>> {
-        // TODO: Implement tagged union parsing
-        // This is complex and requires parsing union variants
-        Err(ParseError::InvalidSyntax {
-            message: "Tagged union typedef parsing not yet implemented".to_string(),
-            span: self.current_span().into(),
-        })
+        self.expect(&TokenKind::Id("union".into()))?;
+        self.expect(&TokenKind::Id("tagged".into()))?;
+
+        self.expect(&TokenKind::SymLBrace)?;
+        let variants = self.parse_union_variants()?;
+        self.expect(&TokenKind::SymRBrace)?;
+
+        let name = self.parse_constructor()?;
+
+        // Parse optional type parameters after the union name
+        let params = if self.eat(&TokenKind::SymHash) {
+            self.expect(&TokenKind::SymLParen)?;
+            let type_params = self.parse_comma_separated(Self::parse_type_param)?;
+            self.expect(&TokenKind::SymRParen)?;
+            type_params.into_iter().map(|(id, _)| id).collect()
+        } else {
+            Vec::new()
+        };
+
+        let derivs = self.parse_derivations()?;
+        self.expect(&TokenKind::SymSemi)?;
+
+        // Create summands for each union variant
+        // Each variant becomes both an original and internal summand
+        let mut original_summands = Vec::new();
+        let mut internal_summands = Vec::new();
+
+        for (tag_index, (tag_name, opt_type)) in variants.iter().enumerate() {
+            // Original summand: reflects the source syntax
+            let original_summand = COriginalSummand {
+                names: vec![tag_name.clone()],
+                arg_types: if let Some(arg_type) = opt_type {
+                    vec![CQType {
+                        context: Vec::new(),
+                        ty: arg_type.clone(),
+                        span: Span::DUMMY,
+                    }]
+                } else {
+                    Vec::new()  // No arguments for void variants
+                },
+                field_names: None,  // Tagged unions don't use field names
+                tag_encoding: None,  // Encoding is handled in internal summand
+            };
+
+            // Internal summand: single argument type for compilation
+            let internal_summand = CInternalSummand {
+                names: vec![tag_name.clone()],
+                arg_type: if let Some(arg_type) = opt_type {
+                    arg_type.clone()
+                } else {
+                    // Use PrimUnit for void variants (like Haskell's idPrimUnit)
+                    CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()))
+                },
+                tag_encoding: tag_index as i64,  // Sequential encoding starting from 0
+            };
+
+            original_summands.push(original_summand);
+            internal_summands.push(internal_summand);
+        }
+
+        let data_def = CDefn::Data(CDataDef {
+            visible: true,
+            name: IdK::Plain(name),
+            params,
+            original_summands,
+            internal_summands,
+            deriving: derivs,
+            span: Span::DUMMY,
+        });
+
+        Ok(vec![data_def])
+    }
+
+    /// Parse union variants: `void Tag1; Type Tag2; ...`
+    fn parse_union_variants(&mut self) -> crate::ParseResult<Vec<(Id, Option<CType>)>> {
+        let mut variants = Vec::new();
+
+        while !self.check(&TokenKind::SymRBrace) && !self.is_eof() {
+            // Check for 'void' keyword first
+            let variant_type = if self.check(&TokenKind::Id("void".into())) {
+                self.advance(); // consume 'void'
+                None
+            } else {
+                // Parse the type first, then the tag name
+                Some(self.parse_type_expr()?)
+            };
+
+            let tag_name = self.parse_constructor()?;
+            self.expect(&TokenKind::SymSemi)?;
+            variants.push((tag_name, variant_type));
+        }
+
+        Ok(variants)
     }
 
     // ========================================================================
@@ -520,8 +748,8 @@ impl<'src> BsvParser<'src> {
 
         self.expect(&TokenKind::KwEndrule)?;
 
-        let pos = Position::unknown();
-        let body_pos = Position::unknown();
+        let pos = Position::new("<unknown>", start_pos as i32, start_pos as i32);
+        let body_pos = Position::new("<unknown>", body_pos_start as i32, body_pos_start as i32);
 
         Ok(ImperativeStatement::Rule {
             pos,
@@ -566,10 +794,104 @@ impl<'src> BsvParser<'src> {
     /// endtypeclass
     /// ```
     pub fn parse_typeclass_decl(&mut self) -> crate::ParseResult<ImperativeStatement> {
-        // TODO: Implement typeclass parsing
-        Err(ParseError::InvalidSyntax {
-            message: "Typeclass declaration parsing not yet implemented".to_string(),
-            span: self.current_span().into(),
+        self.expect(&TokenKind::Id("typeclass".into()))?;
+
+        let name = self.parse_constructor()?;
+
+        // Parse type parameters: #(type a, type b, ...)
+        let type_vars = if self.eat(&TokenKind::SymHash) {
+            self.expect(&TokenKind::SymLParen)?;
+            let params = self.parse_comma_separated(Self::parse_type_param)?;
+            self.expect(&TokenKind::SymRParen)?;
+            params.into_iter().map(|(id, _)| id).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Parse optional provisos
+        let provisos = if self.check(&TokenKind::Id("provisos".into())) {
+            self.advance();
+            self.expect(&TokenKind::SymLParen)?;
+            let provs = self.parse_comma_separated(Self::parse_proviso)?;
+            self.expect(&TokenKind::SymRParen)?;
+            provs
+        } else {
+            Vec::new()
+        };
+
+        // Parse optional functional dependencies
+        let fundeps = if self.check(&TokenKind::Id("dependencies".into())) {
+            self.parse_functional_dependencies()?
+        } else {
+            Vec::new()
+        };
+
+        self.expect(&TokenKind::SymSemi)?;
+
+        // Parse typeclass body (method signatures and default implementations)
+        let mut members = Vec::new();
+        while !self.check(&TokenKind::Id("endtypeclass".into())) && !self.is_eof() {
+            if self.check(&TokenKind::Id("function".into())) {
+                let method = self.parse_typeclass_method()?;
+                members.push(method);
+            } else {
+                return Err(ParseError::InvalidSyntax {
+                    message: format!("Expected method in typeclass, found: {}", self.current_kind().name()),
+                    span: self.current_span().into(),
+                });
+            }
+        }
+
+        self.expect(&TokenKind::Id("endtypeclass".into()))?;
+
+        Ok(ImperativeStatement::TypeclassDefn {
+            name,
+            type_vars,
+            provisos,
+            fundeps,
+            members,
+        })
+    }
+
+    /// Parse a typeclass method signature
+    fn parse_typeclass_method(&mut self) -> crate::ParseResult<CField> {
+        self.expect(&TokenKind::Id("function".into()))?;
+        let ret_type = self.parse_type_expr()?;
+        let name = self.parse_def_identifier()?;
+
+        self.expect(&TokenKind::SymLParen)?;
+        let args = if self.check(&TokenKind::SymRParen) {
+            Vec::new()
+        } else {
+            self.parse_comma_separated(Self::parse_function_arg)?
+        };
+        self.expect(&TokenKind::SymRParen)?;
+        self.expect(&TokenKind::SymSemi)?;
+
+        // Build method type
+        let arg_types: Vec<CType> = args.iter()
+            .filter_map(|(_, ty_opt)| ty_opt.clone())
+            .collect();
+
+        let method_type = if arg_types.is_empty() {
+            ret_type
+        } else {
+            arg_types.into_iter().rev().fold(ret_type, |acc, arg_type| {
+                CType::Fun(Box::new(arg_type), Box::new(acc), Span::DUMMY)
+            })
+        };
+
+        Ok(CField {
+            name,
+            pragmas: None,
+            orig_type: None,
+            ty: CQType {
+                context: Vec::new(),
+                ty: method_type,
+                span: Span::DUMMY,
+            },
+            default: Vec::new(),
+            span: Span::DUMMY,
         })
     }
 
@@ -582,10 +904,53 @@ impl<'src> BsvParser<'src> {
     /// endinstance
     /// ```
     pub fn parse_instance_decl(&mut self) -> crate::ParseResult<ImperativeStatement> {
-        // TODO: Implement instance parsing
-        Err(ParseError::InvalidSyntax {
-            message: "Instance declaration parsing not yet implemented".to_string(),
-            span: self.current_span().into(),
+        self.expect(&TokenKind::Id("instance".into()))?;
+
+        // Parse class name and type arguments: ClassName#(Type1, Type2, ...)
+        let class_name = self.parse_constructor()?;
+
+        let type_args = if self.eat(&TokenKind::SymHash) {
+            self.expect(&TokenKind::SymLParen)?;
+            let types = self.parse_comma_separated(Self::parse_type_expr)?;
+            self.expect(&TokenKind::SymRParen)?;
+            types
+        } else {
+            return Err(ParseError::InvalidSyntax {
+                message: "Instance declaration requires type arguments".to_string(),
+                span: self.current_span().into(),
+            });
+        };
+
+        // Parse optional provisos
+        let provisos = if self.check(&TokenKind::Id("provisos".into())) {
+            self.advance();
+            self.expect(&TokenKind::SymLParen)?;
+            let provs = self.parse_comma_separated(Self::parse_proviso)?;
+            self.expect(&TokenKind::SymRParen)?;
+            provs
+        } else {
+            Vec::new()
+        };
+
+        self.expect(&TokenKind::SymSemi)?;
+
+        // Parse instance body (method implementations)
+        let mut body = Vec::new();
+        while !self.check(&TokenKind::Id("endinstance".into())) && !self.is_eof() {
+            // For now, just skip the body - proper implementation would parse method definitions
+            return Err(ParseError::InvalidSyntax {
+                message: "Instance body parsing not yet implemented".to_string(),
+                span: self.current_span().into(),
+            });
+        }
+
+        self.expect(&TokenKind::Id("endinstance".into()))?;
+
+        Ok(ImperativeStatement::InstanceDefn {
+            class_name,
+            type_args,
+            provisos,
+            body,
         })
     }
 
@@ -599,20 +964,19 @@ impl<'src> BsvParser<'src> {
         self.eat(&TokenKind::Id("parameter".into()));
 
         // Optional kind annotation
-        let _pkind = if self.eat(&TokenKind::Id("numeric".into())) {
-            "numeric" // PKNum
+        let pkind = if self.eat(&TokenKind::Id("numeric".into())) {
+            PartialKind::PKNum
         } else if self.check(&TokenKind::Id("string".into())) {
             self.advance();
-            "string" // PKStr
+            PartialKind::PKStr
         } else {
-            "none" // PKNoInfo
+            PartialKind::PKNoInfo
         };
 
         self.expect(&TokenKind::Id("type".into()))?;
         let name = self.parse_def_identifier()?;
 
-        // TODO: Convert string to PartialKind enum
-        Ok((name, PartialKind::PKNoInfo))
+        Ok((name, pkind))
     }
 
     /// Parse typedef constructor name and parameters: `TypeName[#(params)]`
@@ -631,16 +995,102 @@ impl<'src> BsvParser<'src> {
         Ok((name, params))
     }
 
-    /// Parse enum tags (placeholder)
-    fn parse_enum_tags(&mut self) -> crate::ParseResult<Vec<Id>> {
-        // TODO: Implement enum tag parsing
+    /// Parse enum tags with optional encoding: `Tag1, Tag2 = 5, Tag3[0:2], ...`
+    /// Returns a list of (tag_name, optional_encoding) pairs
+    fn parse_enum_tags(&mut self) -> crate::ParseResult<Vec<(Id, Option<i64>)>> {
         let mut tags = Vec::new();
+        let mut current_encoding = 0i64;
 
-        while !self.check(&TokenKind::SymRBrace) {
-            let tag = self.parse_constructor()?;
-            tags.push(tag);
+        if self.check(&TokenKind::SymRBrace) {
+            return Err(ParseError::InvalidSyntax {
+                message: "Empty enum not allowed".to_string(),
+                span: self.current_span().into(),
+            });
+        }
+
+        loop {
+            let tag_name = self.parse_constructor()?;
+
+            // Check for range notation: Tag[0:2]
+            let tag_range = if self.eat(&TokenKind::SymLBracket) {
+                let from = self.parse_number()? as i64;
+                if self.eat(&TokenKind::SymColon) {
+                    let to = self.parse_number()? as i64;
+                    self.expect(&TokenKind::SymRBracket)?;
+                    Some((from, to))
+                } else {
+                    // Single range like Tag[5] means Tag[0:4]
+                    self.expect(&TokenKind::SymRBracket)?;
+                    Some((0, from - 1))
+                }
+            } else {
+                None
+            };
+
+            // Check for explicit encoding: Tag = 5
+            let explicit_encoding = if self.eat(&TokenKind::SymEq) {
+                let enc = self.parse_number()? as i64;
+                current_encoding = enc;
+                Some(enc)
+            } else {
+                None
+            };
+
+            // Generate tags based on range or single tag
+            match tag_range {
+                Some((from, to)) => {
+                    let start_encoding = explicit_encoding.unwrap_or(current_encoding);
+                    if from <= to {
+                        for i in from..=to {
+                            let range_tag_name = if i == 0 && from == 0 {
+                                tag_name.clone()
+                            } else {
+                                Id::new(
+                                    format!("{}{}", tag_name.name(), i),
+                                    tag_name.position().clone()
+                                )
+                            };
+                            let encoding = if explicit_encoding.is_some() {
+                                Some(start_encoding + (i - from))
+                            } else {
+                                None
+                            };
+                            tags.push((range_tag_name, encoding));
+                            current_encoding += 1;
+                        }
+                    } else {
+                        // Reverse order
+                        for i in (to..=from).rev() {
+                            let range_tag_name = if i == 0 && from != 0 {
+                                tag_name.clone()
+                            } else {
+                                Id::new(
+                                    format!("{}{}", tag_name.name(), i),
+                                    tag_name.position().clone()
+                                )
+                            };
+                            let encoding = if explicit_encoding.is_some() {
+                                Some(start_encoding + (from - i))
+                            } else {
+                                None
+                            };
+                            tags.push((range_tag_name, encoding));
+                            current_encoding += 1;
+                        }
+                    }
+                }
+                None => {
+                    // Single tag
+                    tags.push((tag_name, explicit_encoding));
+                    current_encoding += 1;
+                }
+            }
 
             if !self.eat(&TokenKind::SymComma) {
+                break;
+            }
+
+            if self.check(&TokenKind::SymRBrace) {
                 break;
             }
         }
@@ -648,25 +1098,46 @@ impl<'src> BsvParser<'src> {
         Ok(tags)
     }
 
-    /// Parse derivations (placeholder)
-    fn parse_derivations(&mut self) -> crate::ParseResult<Vec<Id>> {
-        // TODO: Implement derivation parsing
-        // This would parse things like `deriving (Eq, Bits, ...)`
-        Ok(Vec::new())
+    /// Parse derivations: `deriving (Class, Class, ...)`
+    fn parse_derivations(&mut self) -> crate::ParseResult<Vec<CTypeclass>> {
+        if self.eat(&TokenKind::Id("deriving".into())) {
+            self.expect(&TokenKind::SymLParen)?;
+            let classes = self.parse_comma_separated(Self::parse_typeclass)?;
+            self.expect(&TokenKind::SymRParen)?;
+            Ok(classes)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
-    /// Parse a proviso/constraint (placeholder)
-    fn parse_proviso(&mut self) -> crate::ParseResult<CPred> {
-        // TODO: Implement proviso parsing
-        // For now, parse as a basic predicate
-        let class_name = self.parse_def_identifier()?;
-        let mut types = Vec::new();
+    /// Parse a typeclass name for deriving
+    fn parse_typeclass(&mut self) -> crate::ParseResult<CTypeclass> {
+        let class_name = self.parse_constructor()?;
+        Ok(CTypeclass { name: class_name })
+    }
 
-        if self.eat(&TokenKind::SymHash) {
+    /// Parse a proviso/constraint: `ClassName#(Type1, Type2, ...)`
+    fn parse_proviso(&mut self) -> crate::ParseResult<CPred> {
+        let class_name = self.parse_constructor()?;
+
+        // Parse type parameters: #(Type1, Type2, ...)
+        let types = if self.eat(&TokenKind::SymHash) {
             self.expect(&TokenKind::SymLParen)?;
-            types = self.parse_comma_separated(Self::parse_type_expr)?;
+            let params = self.parse_comma_separated(Self::parse_type_expr)?;
             self.expect(&TokenKind::SymRParen)?;
-        }
+            if params.is_empty() {
+                return Err(ParseError::InvalidSyntax {
+                    message: format!("Proviso {} requires type arguments", class_name.name()),
+                    span: self.current_span().into(),
+                });
+            }
+            params
+        } else {
+            return Err(ParseError::InvalidSyntax {
+                message: format!("Proviso {} requires type arguments", class_name.name()),
+                span: self.current_span().into(),
+            });
+        };
 
         Ok(CPred {
             class: class_name,
@@ -729,9 +1200,75 @@ impl<'src> BsvParser<'src> {
         Ok(items)
     }
 
+    /// Parse a decimal number
+    fn parse_number(&mut self) -> crate::ParseResult<u64> {
+        match self.current_kind() {
+            TokenKind::Integer { value, .. } => {
+                // Convert BigInt to u64 by trying to parse the string representation
+                let value_str = value.to_string();
+                if let Ok(n) = value_str.parse::<u64>() {
+                    self.advance();
+                    Ok(n)
+                } else {
+                    Err(ParseError::InvalidSyntax {
+                        message: format!("Integer literal too large: {}", value),
+                        span: self.current_span().into(),
+                    })
+                }
+            }
+            _ => Err(ParseError::UnexpectedToken {
+                expected: "number".to_string(),
+                found: self.current_kind().name().to_string(),
+                span: self.current_span().into(),
+            }),
+        }
+    }
+
     /// Save parser checkpoint for backtracking
     fn save_checkpoint(&self) -> Result<usize, ParseError> {
         Ok(self.pos)
+    }
+
+    /// Parse functional dependencies for typeclasses
+    ///
+    /// Grammar: dependencies ( id_or_tuple determines id_or_tuple, ... )
+    /// Where id_or_tuple is either a single identifier or (id1, id2, ...)
+    fn parse_functional_dependencies(&mut self) -> crate::ParseResult<Vec<(Vec<Id>, Vec<Id>)>> {
+        self.expect(&TokenKind::Id("dependencies".into()))?;
+        self.expect(&TokenKind::SymLParen)?;
+
+        let fundeps = self.parse_comma_separated(|parser| parser.parse_functional_dependency())?;
+
+        self.expect(&TokenKind::SymRParen)?;
+        Ok(fundeps)
+    }
+
+    /// Parse a single functional dependency: id_or_tuple determines id_or_tuple
+    fn parse_functional_dependency(&mut self) -> crate::ParseResult<(Vec<Id>, Vec<Id>)> {
+        // Parse determining type vars (single or tuple)
+        let from_vars = if self.check(&TokenKind::SymLParen) {
+            self.advance(); // consume (
+            let vars = self.parse_comma_separated(Self::parse_def_identifier)?;
+            self.expect(&TokenKind::SymRParen)?;
+            vars
+        } else {
+            vec![self.parse_def_identifier()?]
+        };
+
+        // Expect 'determines' keyword
+        self.expect(&TokenKind::Id("determines".into()))?;
+
+        // Parse determined type vars (single or tuple)
+        let to_vars = if self.check(&TokenKind::SymLParen) {
+            self.advance(); // consume (
+            let vars = self.parse_comma_separated(Self::parse_def_identifier)?;
+            self.expect(&TokenKind::SymRParen)?;
+            vars
+        } else {
+            vec![self.parse_def_identifier()?]
+        };
+
+        Ok((from_vars, to_vars))
     }
 
     /// Restore parser to checkpoint

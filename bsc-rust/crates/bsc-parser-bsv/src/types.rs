@@ -126,9 +126,10 @@ impl<'src> BsvParser<'src> {
 
         // Try parenthesized type expression
         if self.eat(&TokenKind::SymLParen) {
+            let start_pos = self.tokens[self.pos - 1].span.start; // LParen position
             let ty = self.parse_type_expr()?;
-            self.expect(&TokenKind::SymRParen)?;
-            let span = Span::DUMMY; // TODO: Calculate proper span
+            let end_token = self.expect(&TokenKind::SymRParen)?;
+            let span = Span::new(start_pos, end_token.span.end);
             return Ok(CType::Paren(Box::new(ty), span));
         }
 
@@ -173,23 +174,24 @@ impl<'src> BsvParser<'src> {
             return Err(self.unexpected_token("'bit'"));
         }
 
-        let pos = Position::unknown();
+        let start_pos = self.current_span().start;
+        let pos = self.current_position();
         self.advance(); // consume 'bit'
 
         // Check for bit range: [h:0]
-        let width = if self.eat(&TokenKind::SymLBracket) {
+        let (width, end_pos) = if self.eat(&TokenKind::SymLBracket) {
             // Parse high index
             let high = self.parse_bit_range()?;
-            self.expect(&TokenKind::SymRBracket)?;
-            high + 1 // bit[h:0] has h+1 bits
+            let end_token = self.expect(&TokenKind::SymRBracket)?;
+            (high + 1, end_token.span.end) // bit[h:0] has h+1 bits
         } else {
-            1 // plain 'bit' is Bit#(1)
+            (1, self.tokens.get(self.pos - 1).map(|t| t.span.end).unwrap_or(start_pos)) // plain 'bit' is Bit#(1)
         };
 
         // Create Bit#(width)
         let bit_con = CType::Con(Id::new("Bit", pos.clone()));
         let width_type = CType::Num(width as i128, pos.clone());
-        let span = Span::DUMMY; // TODO: Calculate proper span
+        let span = Span::new(start_pos, end_pos);
 
         Ok(CType::Apply(
             Box::new(bit_con),
@@ -198,22 +200,47 @@ impl<'src> BsvParser<'src> {
         ))
     }
 
-    /// Parse bit range (the number inside bit[n:0]).
+    /// Parse bit range in the format [h:0].
+    /// Based on pBitRange' from CVParser.lhs.
+    /// Only supports [h:0] format where the low index must be 0.
     fn parse_bit_range(&mut self) -> ParseResult<u32> {
-        // TODO: Parse proper bit range expression
-        // For now, just parse a simple integer
-        match self.current_kind() {
+        // Parse high index
+        let high = match self.current_kind() {
             TokenKind::Integer { value, .. } => {
                 if let Ok(n) = value.try_into() {
-                    let value: u32 = n;
+                    let high: u32 = n;
                     self.advance();
-                    Ok(value)
+                    high
                 } else {
-                    Err(self.unexpected_token("valid integer"))
+                    return Err(self.unexpected_token("valid integer"));
                 }
             }
-            _ => Err(self.unexpected_token("integer")),
+            _ => return Err(self.unexpected_token("high bit index")),
+        };
+
+        // Expect colon
+        self.expect(&TokenKind::SymColon)?;
+
+        // Parse low index (must be 0)
+        let low = match self.current_kind() {
+            TokenKind::Integer { value, .. } => {
+                if let Ok(n) = value.try_into() {
+                    let low: u32 = n;
+                    self.advance();
+                    low
+                } else {
+                    return Err(self.unexpected_token("valid integer"));
+                }
+            }
+            _ => return Err(self.unexpected_token("low bit index")),
+        };
+
+        // BSV only supports [h:0] format - low index must be 0
+        if low != 0 {
+            return Err(self.unexpected_token("bit range with low index 0"));
         }
+
+        Ok(high)
     }
 
     /// Parse `int` type (32-bit signed integer).
@@ -225,11 +252,12 @@ impl<'src> BsvParser<'src> {
             return Err(self.unexpected_token("'int'"));
         }
 
-        let pos = Position::unknown();
+        let span = self.current_span();
+        let pos = self.current_position();
         self.advance(); // consume 'int'
 
         // Create Int#(32) - mirrors tInt32At from Type.hs
-        Ok(create_int32_type(pos.clone()))
+        Ok(create_int32_type(pos, span))
     }
 
     /// Parse `real` type.
@@ -241,7 +269,7 @@ impl<'src> BsvParser<'src> {
             return Err(self.unexpected_token("'real'"));
         }
 
-        let pos = Position::unknown();
+        let pos = self.current_position();
         self.advance(); // consume 'real'
 
         Ok(create_real_type(pos.clone()))
@@ -256,7 +284,7 @@ impl<'src> BsvParser<'src> {
             return Err(self.unexpected_token("'void'"));
         }
 
-        let pos = Position::unknown();
+        let pos = self.current_position();
         self.advance(); // consume 'void'
 
         Ok(CType::Con(Id::new("()", pos.clone())))
@@ -271,7 +299,7 @@ impl<'src> BsvParser<'src> {
             return Err(self.unexpected_token("'Action'"));
         }
 
-        let pos = Position::unknown();
+        let pos = self.current_position();
         self.advance(); // consume 'Action'
 
         Ok(create_action_type(pos.clone()))
@@ -286,7 +314,7 @@ impl<'src> BsvParser<'src> {
             return Err(self.unexpected_token("'ActionValue'"));
         }
 
-        let pos = Position::unknown();
+        let pos = self.current_position();
         self.advance(); // consume 'ActionValue'
 
         let base_type = create_action_value_type(pos.clone());
@@ -300,22 +328,51 @@ impl<'src> BsvParser<'src> {
     /// Parse a type constructor.
     ///
     /// Implements `pTypeConstructor` from CVParser.lhs.
-    /// Handles qualified constructors and creates `cTCon cons`.
+    /// Handles qualified constructors (Package::Constructor) and creates `cTCon cons`.
     fn parse_type_constructor(&mut self) -> ParseResult<CType> {
-        // TODO: Implement proper qualified constructor parsing
-        // For now, just parse a simple uppercase identifier
-        if let TokenKind::Id(name) = self.current_kind() {
-            // Check if it's an uppercase identifier (type constructor)
+        let pos = self.current_position();
+
+        // Parse optional package qualifier: Package::
+        let package_name = if let TokenKind::Id(name) = self.current_kind() {
             if name.chars().next().unwrap_or('a').is_ascii_uppercase() {
-                let pos = Position::unknown();
-                let id = Id::new(name.clone(), pos.clone());
+                // Could be either a package name or constructor
+                let potential_package = name.clone();
+                self.advance();
+
+                // Check for :: to see if this was a package qualifier
+                if self.eat(&TokenKind::SymColonColon) {
+                    Some(potential_package)
+                } else {
+                    // No ::, so this was actually the constructor
+                    return Ok(CType::Con(Id::new(potential_package, pos)));
+                }
+            } else {
+                return Err(self.unexpected_token("type constructor"));
+            }
+        } else {
+            None
+        };
+
+        // Parse the constructor name
+        if let TokenKind::Id(constructor_name) = self.current_kind() {
+            if constructor_name.chars().next().unwrap_or('a').is_ascii_uppercase() {
+                let qualified_name = if let Some(pkg) = package_name {
+                    format!("{}::{}", pkg, constructor_name)
+                } else {
+                    constructor_name.to_string()
+                };
+                let id = Id::new(qualified_name, pos);
                 self.advance();
                 Ok(CType::Con(id))
             } else {
                 Err(self.unexpected_token("type constructor"))
             }
         } else {
-            Err(self.unexpected_token("type constructor"))
+            if package_name.is_some() {
+                Err(self.unexpected_token("constructor after package qualifier"))
+            } else {
+                Err(self.unexpected_token("type constructor"))
+            }
         }
     }
 
@@ -328,7 +385,7 @@ impl<'src> BsvParser<'src> {
         if let TokenKind::Id(name) = self.current_kind() {
             // Check if it's a lowercase identifier (type variable)
             if name.chars().next().unwrap_or('A').is_ascii_lowercase() {
-                let pos = Position::unknown();
+                let pos = self.current_position();
                 let id = Id::new(name.clone(), pos.clone());
                 self.advance();
                 Ok(CType::Var(id))
@@ -349,7 +406,7 @@ impl<'src> BsvParser<'src> {
             return Err(self.unexpected_token("'module'"));
         }
 
-        let pos = Position::unknown();
+        let pos = self.current_position();
         self.advance(); // consume 'module'
 
         // TDefMonad matches the Haskell implementation
@@ -370,9 +427,58 @@ impl<'src> BsvParser<'src> {
             return Err(self.unexpected_token("'function'"));
         }
 
-        // TODO: Implement full function type parsing
-        // This requires parsing function prototypes and extracting the type
-        Err(self.unexpected_token("function type parsing not yet implemented"))
+        let _pos = self.current_position();
+        self.advance(); // consume 'function'
+
+        // Parse return type
+        let return_type = self.parse_type_expr()?;
+
+        // Parse function name (required for function prototype)
+        if !matches!(self.current_kind(), TokenKind::Id(_)) {
+            return Err(self.unexpected_token("function name"));
+        }
+        self.advance(); // consume function name
+
+        // Parse argument list
+        let arg_types = if self.eat(&TokenKind::SymLParen) {
+            let mut args = Vec::new();
+
+            // Parse arguments: type name, type name, ...
+            if !self.check(&TokenKind::SymRParen) {
+                loop {
+                    // Parse argument type
+                    let arg_type = self.parse_type_expr()?;
+
+                    // Parse argument name (required)
+                    if !matches!(self.current_kind(), TokenKind::Id(_)) {
+                        return Err(self.unexpected_token("argument name"));
+                    }
+                    self.advance(); // consume argument name
+
+                    args.push(arg_type);
+
+                    if self.eat(&TokenKind::SymComma) {
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            self.expect(&TokenKind::SymRParen)?;
+            args
+        } else {
+            Vec::new() // No argument list
+        };
+
+        // Construct function type: arg1 -> arg2 -> ... -> return_type
+        // In BSV, function types are right-associative
+        let mut func_type = return_type;
+        for arg_type in arg_types.into_iter().rev() {
+            func_type = CType::Fun(Box::new(arg_type), Box::new(func_type), Span::DUMMY);
+        }
+
+        Ok(func_type)
     }
 
     // ========================================================================
@@ -430,7 +536,9 @@ impl<'src> BsvParser<'src> {
     /// Creates a left-associative chain of type applications.
     fn apply_type_params(&self, mut base_type: CType, params: Vec<CType>) -> CType {
         for param in params {
-            let span = Span::DUMMY; // TODO: Calculate proper span
+            let base_span = get_type_span(&base_type);
+            let param_span = get_type_span(&param);
+            let span = Span::new(base_span.start, param_span.end.max(base_span.end));
             base_type = CType::Apply(Box::new(base_type), Box::new(param), span);
         }
         base_type
@@ -471,10 +579,12 @@ impl<'src> BsvParser<'src> {
     ///
     /// Grammar: `ConstraintName#(type1, type2, ...)`
     pub fn parse_type_proviso(&mut self) -> ParseResult<CPred> {
+        let start_pos = self.current_span().start;
+
         // Parse constraint constructor (uppercase identifier)
         let constraint_name = if let TokenKind::Id(name) = self.current_kind() {
             if name.chars().next().unwrap_or('a').is_ascii_uppercase() {
-                let pos = Position::unknown();
+                let pos = self.current_position();
                 let name = name.clone();
                 self.advance();
                 Id::new(name.clone(), pos.clone())
@@ -492,10 +602,15 @@ impl<'src> BsvParser<'src> {
             return Err(self.unexpected_token("constraint must have type parameters"));
         }
 
+        // Calculate span from the start of constraint name to the end of parameters
+        let end_pos = self.tokens.get(self.pos.saturating_sub(1))
+            .map(|t| t.span.end)
+            .unwrap_or(start_pos);
+
         Ok(CPred {
             class: constraint_name,
             args: params,
-            span: Span::new(self.current_span().start, self.current_span().end), // TODO: Calculate proper span
+            span: Span::new(start_pos, end_pos),
         })
     }
 
@@ -533,14 +648,32 @@ impl<'src> BsvParser<'src> {
 // Type Constructor Helpers
 // ============================================================================
 
+/// Get the span from a CType.
+///
+/// This helper function extracts span information from various CType variants
+/// to enable accurate span tracking for type applications.
+fn get_type_span(ty: &CType) -> Span {
+    match ty {
+        CType::Apply(_, _, span) => *span,
+        CType::Fun(_, _, span) => *span,
+        CType::Paren(_, span) => *span,
+        CType::Forall(_, _, span) => *span,
+        CType::Tuple(_, span) => *span,
+        CType::List(_, span) => *span,
+        CType::Infix(_, _, _, span) => *span,
+        // For types without explicit span, return DUMMY
+        CType::Con(_) | CType::Var(_) | CType::Num(_, _) | CType::Str(_, _)
+        | CType::DefMonad(_) | CType::NoType => Span::DUMMY,
+    }
+}
+
 
 /// Create an `Int#(32)` type.
 ///
 /// Mirrors `tInt32At pos` from Type.hs.
-fn create_int32_type(pos: Position) -> CType {
+fn create_int32_type(pos: Position, span: Span) -> CType {
     let int_con = CType::Con(Id::new("Int", pos.clone()));
-    let num_32 = CType::Num(32, pos);
-    let span = Span::DUMMY; // TODO: Calculate proper span
+    let num_32 = CType::Num(32, pos.clone());
     CType::Apply(Box::new(int_con), Box::new(num_32), span)
 }
 
