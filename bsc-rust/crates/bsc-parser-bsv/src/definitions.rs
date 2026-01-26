@@ -101,7 +101,7 @@ impl<'src> BsvParser<'src> {
         let (params, ifc_type) = self.parse_module_params()?;
 
         // Parse optional provisos
-        let provisos = if self.check(&TokenKind::Id("provisos".into())) {
+        let provisos = if self.check(&TokenKind::KwProvisos) {
             self.advance(); // consume 'provisos'
             self.expect(&TokenKind::SymLParen)?;
             let provs = self.parse_comma_separated(Self::parse_proviso)?;
@@ -247,7 +247,7 @@ impl<'src> BsvParser<'src> {
         self.expect(&TokenKind::SymRParen)?;
 
         // Parse optional provisos
-        let provisos = if self.check(&TokenKind::Id("provisos".into())) {
+        let provisos = if self.check(&TokenKind::KwProvisos) {
             self.advance(); // consume 'provisos'
             self.expect(&TokenKind::SymLParen)?;
             let provs = self.parse_comma_separated(Self::parse_proviso)?;
@@ -359,7 +359,7 @@ impl<'src> BsvParser<'src> {
         // Parse interface members
         let mut members = Vec::new();
         while !self.check(&TokenKind::KwEndinterface) && !self.is_eof() {
-            if self.check(&TokenKind::Id("method".into())) {
+            if self.check(&TokenKind::KwMethod) {
                 let method = self.parse_method_prototype()?;
                 members.push(method);
             } else if self.check(&TokenKind::KwInterface) {
@@ -387,7 +387,7 @@ impl<'src> BsvParser<'src> {
 
     /// Parse a method prototype: `method RetType methodName(args);`
     fn parse_method_prototype(&mut self) -> crate::ParseResult<CField> {
-        self.expect(&TokenKind::Id("method".into()))?;
+        self.expect(&TokenKind::KwMethod)?;
 
         let ret_type = self.parse_type_expr()?;
         let name = self.parse_def_identifier()?;
@@ -474,11 +474,11 @@ impl<'src> BsvParser<'src> {
         self.expect(&TokenKind::KwTypedef)?;
 
         // Look ahead to determine typedef variant
-        let defs = if self.check(&TokenKind::Id("enum".into())) {
+        let defs = if self.check(&TokenKind::KwEnum) {
             vec![self.parse_typedef_enum()?]
-        } else if self.check(&TokenKind::Id("struct".into())) {
+        } else if self.check(&TokenKind::KwStruct) {
             self.parse_typedef_struct()?
-        } else if self.check(&TokenKind::Id("union".into())) {
+        } else if self.check(&TokenKind::KwUnion) {
             self.parse_typedef_tagged_union()?
         } else {
             vec![self.parse_typedef_synonym()?]
@@ -503,7 +503,7 @@ impl<'src> BsvParser<'src> {
 
     /// Parse an enum typedef: `typedef enum { ... } EnumName;`
     fn parse_typedef_enum(&mut self) -> crate::ParseResult<CDefn> {
-        self.expect(&TokenKind::Id("enum".into()))?;
+        self.expect(&TokenKind::KwEnum)?;
 
         self.expect(&TokenKind::SymLBrace)?;
         let enum_tags = self.parse_enum_tags()?;
@@ -548,7 +548,7 @@ impl<'src> BsvParser<'src> {
 
     /// Parse a struct typedef: `typedef struct { ... } StructName;`
     fn parse_typedef_struct(&mut self) -> crate::ParseResult<Vec<CDefn>> {
-        self.expect(&TokenKind::Id("struct".into()))?;
+        self.expect(&TokenKind::KwStruct)?;
 
         self.expect(&TokenKind::SymLBrace)?;
         let fields = self.parse_struct_fields()?;
@@ -616,8 +616,8 @@ impl<'src> BsvParser<'src> {
 
     /// Parse a tagged union typedef: `typedef union tagged { ... } UnionName;`
     fn parse_typedef_tagged_union(&mut self) -> crate::ParseResult<Vec<CDefn>> {
-        self.expect(&TokenKind::Id("union".into()))?;
-        self.expect(&TokenKind::Id("tagged".into()))?;
+        self.expect(&TokenKind::KwUnion)?;
+        self.expect(&TokenKind::KwTagged)?;
 
         self.expect(&TokenKind::SymLBrace)?;
         let variants = self.parse_union_variants()?;
@@ -695,7 +695,7 @@ impl<'src> BsvParser<'src> {
 
         while !self.check(&TokenKind::SymRBrace) && !self.is_eof() {
             // Check for 'void' keyword first
-            let variant_type = if self.check(&TokenKind::Id("void".into())) {
+            let variant_type = if self.check(&TokenKind::KwVoid) {
                 self.advance(); // consume 'void'
                 None
             } else {
@@ -794,7 +794,7 @@ impl<'src> BsvParser<'src> {
     /// endtypeclass
     /// ```
     pub fn parse_typeclass_decl(&mut self) -> crate::ParseResult<ImperativeStatement> {
-        self.expect(&TokenKind::Id("typeclass".into()))?;
+        self.expect(&TokenKind::KwTypeclass)?;
 
         let name = self.parse_constructor()?;
 
@@ -809,7 +809,7 @@ impl<'src> BsvParser<'src> {
         };
 
         // Parse optional provisos
-        let provisos = if self.check(&TokenKind::Id("provisos".into())) {
+        let provisos = if self.check(&TokenKind::KwProvisos) {
             self.advance();
             self.expect(&TokenKind::SymLParen)?;
             let provs = self.parse_comma_separated(Self::parse_proviso)?;
@@ -830,8 +830,8 @@ impl<'src> BsvParser<'src> {
 
         // Parse typeclass body (method signatures and default implementations)
         let mut members = Vec::new();
-        while !self.check(&TokenKind::Id("endtypeclass".into())) && !self.is_eof() {
-            if self.check(&TokenKind::Id("function".into())) {
+        while !self.check(&TokenKind::KwEndtypeclass) && !self.is_eof() {
+            if self.check(&TokenKind::KwFunction) {
                 let method = self.parse_typeclass_method()?;
                 members.push(method);
             } else {
@@ -842,7 +842,7 @@ impl<'src> BsvParser<'src> {
             }
         }
 
-        self.expect(&TokenKind::Id("endtypeclass".into()))?;
+        self.expect(&TokenKind::KwEndtypeclass)?;
 
         Ok(ImperativeStatement::TypeclassDefn {
             name,
@@ -855,7 +855,7 @@ impl<'src> BsvParser<'src> {
 
     /// Parse a typeclass method signature
     fn parse_typeclass_method(&mut self) -> crate::ParseResult<CField> {
-        self.expect(&TokenKind::Id("function".into()))?;
+        self.expect(&TokenKind::KwFunction)?;
         let ret_type = self.parse_type_expr()?;
         let name = self.parse_def_identifier()?;
 
@@ -904,7 +904,7 @@ impl<'src> BsvParser<'src> {
     /// endinstance
     /// ```
     pub fn parse_instance_decl(&mut self) -> crate::ParseResult<ImperativeStatement> {
-        self.expect(&TokenKind::Id("instance".into()))?;
+        self.expect(&TokenKind::KwInstance)?;
 
         // Parse class name and type arguments: ClassName#(Type1, Type2, ...)
         let class_name = self.parse_constructor()?;
@@ -922,7 +922,7 @@ impl<'src> BsvParser<'src> {
         };
 
         // Parse optional provisos
-        let provisos = if self.check(&TokenKind::Id("provisos".into())) {
+        let provisos = if self.check(&TokenKind::KwProvisos) {
             self.advance();
             self.expect(&TokenKind::SymLParen)?;
             let provs = self.parse_comma_separated(Self::parse_proviso)?;
@@ -936,7 +936,7 @@ impl<'src> BsvParser<'src> {
 
         // Parse instance body (method implementations)
         let mut body = Vec::new();
-        while !self.check(&TokenKind::Id("endinstance".into())) && !self.is_eof() {
+        while !self.check(&TokenKind::KwEndinstance) && !self.is_eof() {
             // For now, just skip the body - proper implementation would parse method definitions
             return Err(ParseError::InvalidSyntax {
                 message: "Instance body parsing not yet implemented".to_string(),
@@ -944,7 +944,7 @@ impl<'src> BsvParser<'src> {
             });
         }
 
-        self.expect(&TokenKind::Id("endinstance".into()))?;
+        self.expect(&TokenKind::KwEndinstance)?;
 
         Ok(ImperativeStatement::InstanceDefn {
             class_name,
@@ -961,7 +961,7 @@ impl<'src> BsvParser<'src> {
     /// Parse a type parameter: `type paramName`
     fn parse_type_param(&mut self) -> crate::ParseResult<(Id, PartialKind)> {
         // Optional 'parameter' keyword
-        self.eat(&TokenKind::Id("parameter".into()));
+        self.eat(&TokenKind::KwParameter);
 
         // Optional kind annotation
         let pkind = if self.eat(&TokenKind::Id("numeric".into())) {
@@ -973,7 +973,7 @@ impl<'src> BsvParser<'src> {
             PartialKind::PKNoInfo
         };
 
-        self.expect(&TokenKind::Id("type".into()))?;
+        self.expect(&TokenKind::KwType)?;
         let name = self.parse_def_identifier()?;
 
         Ok((name, pkind))
@@ -1100,7 +1100,7 @@ impl<'src> BsvParser<'src> {
 
     /// Parse derivations: `deriving (Class, Class, ...)`
     fn parse_derivations(&mut self) -> crate::ParseResult<Vec<CTypeclass>> {
-        if self.eat(&TokenKind::Id("deriving".into())) {
+        if self.eat(&TokenKind::KwDeriving) {
             self.expect(&TokenKind::SymLParen)?;
             let classes = self.parse_comma_separated(Self::parse_typeclass)?;
             self.expect(&TokenKind::SymRParen)?;

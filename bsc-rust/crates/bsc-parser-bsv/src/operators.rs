@@ -424,9 +424,7 @@ pub fn binary_precedence(token: &TokenKind) -> Option<usize> {
 /// as function calls: `CBinOp left op right` becomes `CApply op [left, right]`.
 pub fn make_binary_expr(left: CExpr, op_id: Id, right: CExpr) -> CExpr {
     use bsc_diagnostics::Span;
-    let op_pos = op_id.position();
-    let span = Span::DUMMY;
-    CExpr::Apply(Box::new(CExpr::Var(op_id.clone())), vec![left, right], span)
+    CExpr::Infix(Box::new(left), op_id, Box::new(right), Span::DUMMY)
 }
 
 /// Create a unary prefix expression.

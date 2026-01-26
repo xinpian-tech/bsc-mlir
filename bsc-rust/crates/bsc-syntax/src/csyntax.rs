@@ -856,6 +856,7 @@ pub enum CExpr {
     },
     /// Array/bit indexing: e[i]
     Index {
+        pos: Position,
         /// Array/bit-vector expression
         expr: Box<CExpr>,
         /// Index expression

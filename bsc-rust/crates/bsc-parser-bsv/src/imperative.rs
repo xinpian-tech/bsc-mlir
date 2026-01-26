@@ -13,6 +13,20 @@ use bsc_syntax::id::Id;
 use bsc_syntax::Literal;
 use smol_str::SmolStr;
 
+fn clet_seq(defls: Vec<CDefl>, body: CExpr) -> CExpr {
+    if defls.is_empty() {
+        return body;
+    }
+    match body {
+        CExpr::LetSeq(mut inner_defls, inner_body, span) => {
+            let mut merged = defls;
+            merged.append(&mut inner_defls);
+            CExpr::LetSeq(merged, inner_body, span)
+        }
+        _ => CExpr::LetSeq(defls, Box::new(body), Span::DUMMY),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImperativeStmtContext {
     ISCToplevel,
@@ -134,6 +148,12 @@ pub enum ImperativeStatement {
         init_pos: Option<Position>,
     },
 
+    TupleDecl {
+        names: Vec<Id>,
+        ty: Option<CType>,
+        init: Option<CExpr>,
+    },
+
     InterfaceVarDecl {
         name: Id,
         ty: CType,
@@ -196,6 +216,13 @@ pub enum ImperativeStatement {
         pos: Position,
         subject: CExpr,
         arms: Vec<(Vec<CExpr>, Vec<ImperativeStatement>)>,
+        default: Option<Vec<ImperativeStatement>>,
+    },
+
+    CaseTagged {
+        pos: Position,
+        subject: CExpr,
+        arms: Vec<(Position, CPat, Vec<CExpr>, Vec<ImperativeStatement>)>,
         default: Option<Vec<ImperativeStatement>>,
     },
 
@@ -476,6 +503,102 @@ fn build_instance_type(class_name: Id, type_args: Vec<CType>, provisos: Vec<CPre
         context: provisos,
         ty: instance_ty,
         span: Span::DUMMY,
+    }
+}
+
+fn convert_case_to_expr(
+    pos: Position,
+    subject: CExpr,
+    arms: Vec<(Vec<CExpr>, Vec<ImperativeStatement>)>,
+    default: Option<Vec<ImperativeStatement>>,
+) -> CExpr {
+    let mut case_arms: Vec<CCaseArm> = Vec::new();
+
+    for (tests, body) in arms {
+        let arm_pos = if let Some(first_test) = tests.first() {
+            get_expr_position(first_test)
+        } else {
+            pos.clone()
+        };
+
+        let body_expr = convert_stmts_to_expr(body);
+
+        let filters = if tests.is_empty() {
+            vec![]
+        } else {
+            let eq_tests: Vec<COperand> = tests
+                .iter()
+                .map(|test| {
+                    let test_pos = get_expr_position(test);
+                    COperand::Expr(CExpr::OperChain(
+                        vec![
+                            COperand::Expr(subject.clone()),
+                            COperand::Operator {
+                                arity: 2,
+                                name: Id::qualified("Prelude", "==", test_pos),
+                            },
+                            COperand::Expr(test.clone()),
+                        ],
+                        Span::DUMMY,
+                    ))
+                })
+                .collect();
+
+            let filter_expr = if eq_tests.len() == 1 {
+                CExpr::OperChain(vec![eq_tests.into_iter().next().unwrap()], Span::DUMMY)
+            } else {
+                let mut ops: Vec<COperand> = Vec::new();
+                for (i, test) in eq_tests.into_iter().enumerate() {
+                    if i > 0 {
+                        ops.push(COperand::Operator {
+                            arity: 2,
+                            name: Id::qualified("Prelude", "||", arm_pos.clone()),
+                        });
+                    }
+                    ops.push(test);
+                }
+                CExpr::OperChain(ops, Span::DUMMY)
+            };
+            vec![CQual::Filter(filter_expr)]
+        };
+
+        case_arms.push(CCaseArm {
+            pattern: CPat::Wildcard(arm_pos),
+            qualifiers: filters,
+            body: body_expr,
+            span: Span::DUMMY,
+        });
+    }
+
+    if let Some(dflt_body) = default {
+        let dflt_pos = pos.clone();
+        let dflt_expr = convert_stmts_to_expr(dflt_body);
+        case_arms.push(CCaseArm {
+            pattern: CPat::Wildcard(dflt_pos),
+            qualifiers: vec![],
+            body: dflt_expr,
+            span: Span::DUMMY,
+        });
+    }
+
+    let case_subject = CExpr::Struct(
+        Some(true),
+        Id::qualified("Prelude", "PrimUnit", pos.clone()),
+        vec![],
+        Span::DUMMY,
+    );
+
+    CExpr::Case(pos, Box::new(case_subject), case_arms)
+}
+
+fn get_expr_position(expr: &CExpr) -> Position {
+    match expr {
+        CExpr::Lit(_, pos) => pos.clone(),
+        CExpr::Var(id) => id.position(),
+        CExpr::Con(id, _, _) => id.position(),
+        CExpr::Apply(func, _, _) => get_expr_position(func),
+        CExpr::Any { position, .. } => position.clone(),
+        _ => Position::unknown(),
     }
 }
 
@@ -1101,17 +1224,6 @@ fn get_innermost_index_position(expr: &CExpr) -> Position {
     }
 }
 
-pub fn get_expr_position(expr: &CExpr) -> Position {
-    match expr {
-        CExpr::Var(id) => id.position(),
-        CExpr::Index { expr, .. } => get_expr_position(expr),
-        CExpr::Select(base, _, _) => get_expr_position(base),
-        CExpr::Apply(func, _, _) => get_expr_position(func),
-        CExpr::Lit(_, pos) => pos.clone(),
-        _ => Position::unknown(),
-    }
-}
-
 fn build_nested_update(lhs: &CExpr, value: CExpr) -> Option<(Id, CExpr)> {
     match lhs {
         CExpr::Var(id) => Some((id.clone(), value)),
@@ -1430,84 +1542,25 @@ fn convert_for_loop_to_expr_pure(
     let tuple_pattern = build_tuple_pattern(&all_vars);
     let result_tuple = build_tuple_expr(&all_vars);
 
-    let mut then_defls: Vec<CDefl> = Vec::new();
-    for stmt in &body {
-        if let ImperativeStatement::Update { lhs, rhs, .. } = stmt {
-            if let Some((var_name, update_expr)) = build_nested_update(lhs, rhs.clone()) {
-                let var_type = all_vars.iter()
-                    .find(|(v, _)| v.name() == var_name.name())
-                    .map(|(_, t)| t.clone())
-                    .or_else(|| var_types.get(var_name.name()).cloned())
-                    .unwrap_or_else(|| {
-                        CType::Var(Id::new(SmolStr::new_static("a"), Position::unknown()))
-                    });
-
-                then_defls.push(CDefl::ValueSign(
-                    CDef::Untyped {
-                        name: var_name,
-                        ty: CQType {
-                            context: vec![],
-                            ty: var_type,
-                            span: Span::DUMMY,
-                        },
-                        clauses: vec![CClause {
-                            patterns: vec![],
-                            qualifiers: vec![],
-                            body: update_expr,
-                            span: Span::DUMMY,
-                        }],
-                        span: Span::DUMMY,
-                    },
-                    vec![],
-                    Span::DUMMY,
-                ));
-            }
-        }
-    }
-
-    for stmt in &update {
-        if let ImperativeStatement::Equal { name, expr } = stmt {
-            let mut name_with_keep = name.clone();
-            name_with_keep.add_prop(bsc_syntax::id::IdProp::Keep);
-
-            let var_type = all_vars.iter()
-                .find(|(v, _)| v.name() == name.name())
-                .map(|(_, t)| t.clone())
-                .unwrap_or_else(|| integer_ty.clone());
-
-            then_defls.push(CDefl::ValueSign(
-                CDef::Untyped {
-                    name: name_with_keep,
-                    ty: CQType {
-                        context: vec![],
-                        ty: var_type,
-                        span: Span::DUMMY,
-                    },
-                    clauses: vec![CClause {
-                        patterns: vec![],
-                        qualifiers: vec![],
-                        body: expr.clone(),
-                        span: Span::DUMMY,
-                    }],
-                    span: Span::DUMMY,
-                },
-                vec![],
-                Span::DUMMY,
-            ));
-        }
-    }
-
     let recursive_call = CExpr::Apply(
         Box::new(CExpr::Var(f_id.clone())),
         vec![build_tuple_expr(&all_vars)],
         Span::DUMMY,
     );
 
-    let then_body = if then_defls.is_empty() {
-        recursive_call
-    } else {
-        CExpr::LetSeq(then_defls, Box::new(recursive_call), Span::DUMMY)
-    };
+    let mut while_body_stmts = body.clone();
+    while_body_stmts.extend(update.clone());
+    while_body_stmts.push(ImperativeStatement::NakedExpr(recursive_call.clone()));
+
+    let mut while_var_types = var_types.clone();
+    for (v, t) in &loop_vars {
+        while_var_types.insert(v.name().clone(), t.clone());
+    }
+    for (v, t) in &updated_vars_with_types {
+        while_var_types.insert(v.name().clone(), t.clone());
+    }
+
+    let then_body = convert_stmts_to_expr_with_types(while_body_stmts, &while_var_types);
 
     let if_expr = CExpr::If(
         pos.clone(),
@@ -1683,6 +1736,26 @@ pub fn convert_stmts_to_expr_with_types(stmts: Vec<ImperativeStatement>, var_typ
             })
         }
         Some(ImperativeStatement::NakedExpr(expr)) => expr,
+        Some(ImperativeStatement::Case { pos, subject, arms, default }) => {
+            convert_case_to_expr(pos, subject, arms, default)
+        }
+        Some(ImperativeStatement::If { pos, cond, then_branch, else_branch }) => {
+            let then_expr = convert_stmts_to_expr(then_branch);
+            let else_expr = else_branch
+                .map(convert_stmts_to_expr)
+                .unwrap_or_else(|| {
+                    CExpr::Struct(
+                        Some(true),
+                        Id::qualified("Prelude", "PrimUnit", Position::unknown()),
+                        vec![],
+                        Span::DUMMY,
+                    )
+                });
+            CExpr::If(pos, Box::new(cond), Box::new(then_expr), Box::new(else_expr))
+        }
+        Some(ImperativeStatement::BeginEnd { stmts: inner_stmts, .. }) => {
+            convert_stmts_to_expr(inner_stmts)
+        }
         Some(other) => {
             stmts.push(other);
             CExpr::Struct(
@@ -1703,34 +1776,41 @@ pub fn convert_stmts_to_expr_with_types(stmts: Vec<ImperativeStatement>, var_typ
     };
 
     let mut pending_defls: Vec<CDefl> = Vec::new();
+    let mut local_var_types = var_types.clone();
+
+    for stmt in &stmts {
+        if let ImperativeStatement::Decl { name, ty: Some(t), .. } = stmt {
+            local_var_types.insert(name.name().clone(), t.clone());
+        }
+    }
 
     for stmt in stmts.into_iter().rev() {
-        if let Some(defl) = stmt_to_defl(&stmt) {
+        if let Some(defl) = stmt_to_defl(&stmt, &local_var_types) {
             pending_defls.push(defl);
         } else if let ImperativeStatement::For { pos, init, cond, update, body } = stmt {
-            let for_defls = convert_for_loop_to_expr_pure(pos, init, cond, update, body, &var_types);
+            let for_defls = convert_for_loop_to_expr_pure(pos, init, cond, update, body, &local_var_types);
             for defl in for_defls.into_iter().rev() {
                 pending_defls.push(defl);
             }
         } else {
             if !pending_defls.is_empty() {
                 pending_defls.reverse();
-                result = CExpr::LetSeq(pending_defls, Box::new(result), Span::DUMMY);
+                result = clet_seq(pending_defls, result);
                 pending_defls = Vec::new();
             }
-            result = wrap_non_defl_stmt(stmt, result);
+            result = wrap_non_defl_stmt(stmt, result, &local_var_types);
         }
     }
 
     if !pending_defls.is_empty() {
         pending_defls.reverse();
-        result = CExpr::LetSeq(pending_defls, Box::new(result), Span::DUMMY);
+        result = clet_seq(pending_defls, result);
     }
 
     result
 }
 
-fn stmt_to_defl(stmt: &ImperativeStatement) -> Option<CDefl> {
+fn stmt_to_defl(stmt: &ImperativeStatement, var_types: &std::collections::HashMap<SmolStr, CType>) -> Option<CDefl> {
     match stmt {
         ImperativeStatement::Let { name, expr } => {
             let mut name_with_keep = name.clone();
@@ -1791,17 +1871,37 @@ fn stmt_to_defl(stmt: &ImperativeStatement) -> Option<CDefl> {
             }
         }
         ImperativeStatement::Equal { name, expr } => {
-            Some(CDefl::Value(
-                name.clone(),
-                vec![CClause {
-                    patterns: vec![],
-                    qualifiers: vec![],
-                    body: expr.clone(),
-                    span: Span::DUMMY,
-                }],
-                vec![],
-                Span::DUMMY,
-            ))
+            let mut name_with_keep = name.clone();
+            name_with_keep.add_prop(bsc_syntax::id::IdProp::Keep);
+            let cls = vec![CClause {
+                patterns: vec![],
+                qualifiers: vec![],
+                body: expr.clone(),
+                span: Span::DUMMY,
+            }];
+            if let Some(t) = var_types.get(name.name()) {
+                Some(CDefl::ValueSign(
+                    CDef::Untyped {
+                        name: name_with_keep,
+                        ty: CQType {
+                            context: vec![],
+                            ty: t.clone(),
+                            span: Span::DUMMY,
+                        },
+                        clauses: cls,
+                        span: Span::DUMMY,
+                    },
+                    vec![],
+                    Span::DUMMY,
+                ))
+            } else {
+                Some(CDefl::Value(
+                    name_with_keep,
+                    cls,
+                    vec![],
+                    Span::DUMMY,
+                ))
+            }
         }
         ImperativeStatement::ArrayDecl {
             name,
@@ -1842,7 +1942,99 @@ fn stmt_to_defl(stmt: &ImperativeStatement) -> Option<CDefl> {
     }
 }
 
-fn wrap_non_defl_stmt(stmt: ImperativeStatement, rest: CExpr) -> CExpr {
+fn make_result_expr(pos: Position, updated_vars: &[Id], inner_expr: CExpr, rest: CExpr, var_types: &std::collections::HashMap<SmolStr, CType>) -> CExpr {
+    if updated_vars.is_empty() {
+        return rest;
+    }
+
+    let mut result_id = Id::new(SmolStr::new_static("_theResult__"), pos.clone());
+    result_id.add_prop(bsc_syntax::id::IdProp::Renaming);
+
+    let first_var = &updated_vars[0];
+
+    let var_type = var_types.get(first_var.name())
+        .cloned()
+        .unwrap_or_else(|| CType::Var(Id::new(SmolStr::new_static("a"), Position::unknown())));
+
+    let result_def = CDefl::ValueSign(
+        CDef::Untyped {
+            name: result_id.clone(),
+            ty: CQType {
+                context: vec![],
+                ty: var_type,
+                span: Span::DUMMY,
+            },
+            clauses: vec![CClause {
+                patterns: vec![],
+                qualifiers: vec![],
+                body: inner_expr,
+                span: Span::DUMMY,
+            }],
+            span: Span::DUMMY,
+        },
+        vec![],
+        Span::DUMMY,
+    );
+
+    let match_defl = CDefl::Match(
+        CPat::Var(first_var.clone()),
+        CExpr::Var(result_id),
+        Span::DUMMY,
+    );
+
+    clet_seq(vec![result_def, match_defl], rest)
+}
+
+fn convert_if_to_expr_with_updated_vars(
+    pos: Position,
+    cond: CExpr,
+    then_branch: Vec<ImperativeStatement>,
+    else_branch: Option<Vec<ImperativeStatement>>,
+    updated_vars: &[Id],
+    var_types: &std::collections::HashMap<SmolStr, CType>,
+) -> CExpr {
+    let result_var = if !updated_vars.is_empty() {
+        Some(CExpr::Var(updated_vars[0].clone()))
+    } else {
+        None
+    };
+
+    let then_stmts = if let Some(ref result) = result_var {
+        let mut stmts = then_branch;
+        stmts.push(ImperativeStatement::NakedExpr(result.clone()));
+        stmts
+    } else {
+        then_branch
+    };
+
+    let then_expr = convert_stmts_to_expr_with_types(then_stmts, var_types);
+
+    let else_expr = if let Some(else_stmts) = else_branch {
+        let stmts = if let Some(ref result) = result_var {
+            let mut s = else_stmts;
+            s.push(ImperativeStatement::NakedExpr(result.clone()));
+            s
+        } else {
+            else_stmts
+        };
+        convert_stmts_to_expr_with_types(stmts, var_types)
+    } else {
+        if let Some(ref result) = result_var {
+            result.clone()
+        } else {
+            CExpr::Struct(
+                Some(true),
+                Id::qualified("Prelude", "PrimUnit", Position::unknown()),
+                vec![],
+                Span::DUMMY,
+            )
+        }
+    };
+
+    CExpr::If(pos, Box::new(cond), Box::new(then_expr), Box::new(else_expr))
+}
+
+fn wrap_non_defl_stmt(stmt: ImperativeStatement, rest: CExpr, var_types: &std::collections::HashMap<SmolStr, CType>) -> CExpr {
     match stmt {
         ImperativeStatement::If {
             pos,
@@ -1850,22 +2042,35 @@ fn wrap_non_defl_stmt(stmt: ImperativeStatement, rest: CExpr) -> CExpr {
             then_branch,
             else_branch,
         } => {
-            let then_expr = convert_stmts_to_expr(then_branch);
-            let else_expr = else_branch
-                .map(convert_stmts_to_expr)
-                .unwrap_or_else(|| {
-                    CExpr::Struct(
-                        Some(true),
-                        Id::qualified("Prelude", "PrimUnit", Position::unknown()),
-                        vec![],
-                        Span::DUMMY,
-                    )
-                });
-            CExpr::LetSeq(
-                vec![],
-                Box::new(CExpr::If(pos, Box::new(cond), Box::new(then_expr), Box::new(else_expr))),
-                Span::DUMMY,
-            )
+            let mut all_stmts = then_branch.clone();
+            if let Some(ref else_stmts) = else_branch {
+                all_stmts.extend(else_stmts.clone());
+            }
+            let updated_vars = collect_updated_vars_from_stmts(&all_stmts);
+
+            if updated_vars.is_empty() {
+                let then_expr = convert_stmts_to_expr_with_types(then_branch, var_types);
+                let else_expr = else_branch
+                    .map(|s| convert_stmts_to_expr_with_types(s, var_types))
+                    .unwrap_or_else(|| {
+                        CExpr::Struct(
+                            Some(true),
+                            Id::qualified("Prelude", "PrimUnit", Position::unknown()),
+                            vec![],
+                            Span::DUMMY,
+                        )
+                    });
+                CExpr::LetSeq(
+                    vec![],
+                    Box::new(CExpr::If(pos, Box::new(cond), Box::new(then_expr), Box::new(else_expr))),
+                    Span::DUMMY,
+                )
+            } else {
+                let if_expr = convert_if_to_expr_with_updated_vars(
+                    pos.clone(), cond, then_branch, else_branch, &updated_vars, var_types
+                );
+                make_result_expr(pos, &updated_vars, if_expr, rest, var_types)
+            }
         }
         ImperativeStatement::For { pos, init, cond, update, body } => {
             let for_stmts = convert_for_loop_to_cstmts(pos, init, cond, update, body);
@@ -1874,6 +2079,31 @@ fn wrap_non_defl_stmt(stmt: ImperativeStatement, rest: CExpr) -> CExpr {
                 _ => None,
             }).flatten().collect::<Vec<_>>();
             CExpr::LetSeq(for_defl, Box::new(rest), Span::DUMMY)
+        }
+        ImperativeStatement::Case { pos, subject, arms, default } => {
+            let case_expr = convert_case_to_expr(pos, subject, arms, default);
+            CExpr::LetSeq(
+                vec![],
+                Box::new(case_expr),
+                Span::DUMMY,
+            )
+        }
+        ImperativeStatement::BeginEnd { pos, stmts } => {
+            let updated_vars = collect_updated_vars_from_stmts(&stmts);
+            if updated_vars.is_empty() {
+                let inner = convert_stmts_to_expr_with_types(stmts, var_types);
+                CExpr::LetSeq(
+                    vec![],
+                    Box::new(inner),
+                    Span::DUMMY,
+                )
+            } else {
+                let result_var = CExpr::Var(updated_vars[0].clone());
+                let mut inner_stmts = stmts;
+                inner_stmts.push(ImperativeStatement::NakedExpr(result_var));
+                let inner = convert_stmts_to_expr_with_types(inner_stmts, var_types);
+                make_result_expr(pos, &updated_vars, inner, rest, var_types)
+            }
         }
         _ => rest,
     }
@@ -3086,6 +3316,39 @@ fn conv_imperative_stmts_to_cstmts(
         return vec![];
     }
 
+    // Pre-process: merge InterfaceVarDecl + Inst pairs into a single Inst with type info
+    // In Haskell BSV, "Type name();\n constructor instName(name);" produces one ISInst.
+    let stmts = {
+        let mut merged = Vec::new();
+        let mut iter = stmts.into_iter().peekable();
+        while let Some(stmt) = iter.next() {
+            if let ImperativeStatement::InterfaceVarDecl { ref name, ref ty } = stmt {
+                // Check if next statement is an Inst that uses this var decl
+                if let Some(ImperativeStatement::Inst { ifc_var, .. }) = iter.peek() {
+                    if ifc_var.name() == name.name() {
+                        // Merge: take the Inst and add the type from InterfaceVarDecl
+                        if let Some(ImperativeStatement::Inst { pos, attrs, ifc_var, inst_var, ifc_type: _, clocked_by, reset_by, powered_by, constructor }) = iter.next() {
+                            merged.push(ImperativeStatement::Inst {
+                                pos,
+                                attrs,
+                                ifc_var,
+                                inst_var,
+                                ifc_type: Some(ty.clone()),
+                                clocked_by,
+                                reset_by,
+                                powered_by,
+                                constructor,
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+            merged.push(stmt);
+        }
+        merged
+    };
+
     let mut result = Vec::new();
     let len = stmts.len();
 
@@ -3375,8 +3638,106 @@ fn conv_imperative_stmts_to_cstmts(
                     span: Span::DUMMY,
                 });
             }
+            ImperativeStatement::Inst { pos, attrs: _, ifc_var, inst_var, ifc_type, clocked_by: _, reset_by: _, powered_by: _, constructor } => {
+                let instance_name_expr = CExpr::Apply(
+                    Box::new(CExpr::Var(Id::qualified("Prelude", "primGetName", Position::unknown()))),
+                    vec![CExpr::Var(inst_var)],
+                    Span::DUMMY,
+                );
+                if let Some(ref ty) = ifc_type {
+                    result.push(CStmt::BindT {
+                        pattern: CPat::Var(ifc_var.clone()),
+                        instance_name: Some(Box::new(instance_name_expr)),
+                        pragmas: vec![],
+                        ty: CQType {
+                            context: vec![],
+                            ty: ty.clone(),
+                            span: Span::DUMMY,
+                        },
+                        expr: constructor,
+                        span: Span::DUMMY,
+                    });
+                } else {
+                    result.push(CStmt::Bind {
+                        pattern: CPat::Var(ifc_var),
+                        instance_name: Some(Box::new(instance_name_expr)),
+                        pragmas: vec![],
+                        expr: constructor,
+                        span: Span::DUMMY,
+                    });
+                }
+            }
+            ImperativeStatement::InterfaceVarDecl { name, ty } => {
+                let mut name_keep = name.clone();
+                name_keep.add_prop(bsc_syntax::id::IdProp::Keep);
+                let instance_name_expr = CExpr::Apply(
+                    Box::new(CExpr::Var(Id::qualified("Prelude", "primGetName", Position::unknown()))),
+                    vec![CExpr::Var(name_keep.clone())],
+                    Span::DUMMY,
+                );
+                let constructor = CExpr::Var(name_keep.clone());
+                result.push(CStmt::BindT {
+                    pattern: CPat::Var(name_keep),
+                    instance_name: Some(Box::new(instance_name_expr)),
+                    pragmas: vec![],
+                    ty: CQType {
+                        context: vec![],
+                        ty,
+                        span: Span::DUMMY,
+                    },
+                    expr: constructor,
+                    span: Span::DUMMY,
+                });
+            }
+            ImperativeStatement::For { pos, init, cond, update, body } => {
+                let init_stmts = conv_imperative_stmts_to_cstmts(context, ifc_type.clone(), false, init);
+                let update_stmts = conv_imperative_stmts_to_cstmts(context, ifc_type.clone(), false, update);
+                let body_stmts = conv_imperative_stmts_to_cstmts(context, ifc_type.clone(), false, body);
+                result.extend(init_stmts);
+                let for_body_expr = if context == ImperativeStmtContext::ISCAction {
+                    CExpr::Action(pos.clone(), body_stmts)
+                } else {
+                    CExpr::Do { recursive: false, stmts: body_stmts, span: Span::DUMMY }
+                };
+                result.push(CStmt::Expr {
+                    instance_name: None,
+                    expr: for_body_expr,
+                    span: Span::DUMMY,
+                });
+            }
+            ImperativeStatement::TupleDecl { names, ty: _, init } => {
+                if let Some(init_expr) = init {
+                    let pat = CPat::Con(
+                        Id::new(SmolStr::new_static(","), Position::unknown()),
+                        names.iter().map(|n| {
+                            let mut nk = n.clone();
+                            nk.add_prop(bsc_syntax::id::IdProp::Keep);
+                            CPat::Var(nk)
+                        }).collect(),
+                        Span::DUMMY,
+                    );
+                    result.push(CStmt::LetSeq(vec![
+                        CDefl::Match(pat, init_expr, Span::DUMMY),
+                    ], Span::DUMMY));
+                }
+            }
             _ => {}
         }
+    }
+
+    if at_end && matches!(context, ImperativeStmtContext::ISCIsModule | ImperativeStmtContext::ISCModule) {
+        let ifc_id = ifc_type.as_ref().and_then(left_con);
+        let ifc_expr = CExpr::Interface(Position::unknown(), ifc_id, vec![]);
+        let return_expr = CExpr::Apply(
+            Box::new(CExpr::Var(Id::qualified("Prelude", "return", Position::unknown()))),
+            vec![ifc_expr],
+            Span::DUMMY,
+        );
+        result.push(CStmt::Expr {
+            instance_name: None,
+            expr: return_expr,
+            span: Span::DUMMY,
+        });
     }
 
     result

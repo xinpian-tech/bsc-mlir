@@ -140,20 +140,11 @@ impl fmt::Display for Literal {
 
 impl fmt::Display for IntLiteral {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(width) = self.width {
-            match self.base {
-                IntBase::Binary => write!(f, "{width}'b{:b}", self.value),
-                IntBase::Octal => write!(f, "{width}'o{:o}", self.value),
-                IntBase::Decimal => write!(f, "{width}'d{}", self.value),
-                IntBase::Hexadecimal => write!(f, "{width}'h{:x}", self.value),
-            }
-        } else {
-            match self.base {
-                IntBase::Binary => write!(f, "0b{:b}", self.value),
-                IntBase::Octal => write!(f, "0o{:o}", self.value),
-                IntBase::Decimal => write!(f, "{}", self.value),
-                IntBase::Hexadecimal => write!(f, "0x{:X}", self.value),
-            }
+        match self.base {
+            IntBase::Binary => write!(f, "0b{:b}", self.value),
+            IntBase::Octal => write!(f, "0o{:o}", self.value),
+            IntBase::Decimal => write!(f, "{}", self.value),
+            IntBase::Hexadecimal => write!(f, "0x{:X}", self.value),
         }
     }
 }

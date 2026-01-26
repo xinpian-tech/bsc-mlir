@@ -25,7 +25,7 @@ pub mod patterns;
 pub mod types;
 
 use bsc_diagnostics::{ParseError, Span, Position};
-use bsc_lexer_bsv::{Lexer, Token, TokenKind};
+use bsc_lexer_bsv::{Lexer, LexerFlags, Token, TokenKind};
 use bsc_syntax::{
     CDefn, CExpr, CPackage, CPat, CType, CDef, CQType, CClause, CPragma, CStructDef,
     StructSubType, IdK, CField, CValueDef
@@ -91,7 +91,11 @@ impl<'src> BsvParser<'src> {
     /// Returns an error if lexing fails (e.g., unterminated string,
     /// invalid character).
     pub fn new(source: &'src str) -> ParseResult<Self> {
-        let lexer = Lexer::new(source);
+        Self::new_with_file(source, "")
+    }
+
+    pub fn new_with_file(source: &'src str, filename: &str) -> ParseResult<Self> {
+        let lexer = Lexer::with_file(source, LexerFlags::default(), filename);
         let tokens = lexer.tokenize().map_err(|e| ParseError::InvalidSyntax {
             message: format!("Lexer error: {e}"),
             span: Span::DUMMY.into(),
@@ -535,7 +539,7 @@ pub fn parse_package_with_file(source: &str, filename: &str) -> Result<CPackage,
         .unwrap_or("DefaultPackage")
         .to_string();
 
-    let mut parser = BsvParser::new(source)
+    let mut parser = BsvParser::new_with_file(source, filename)
         .map_err(|e: ParseError| vec![ParseErrorInfo { message: e.to_string() }])?;
 
     parser.parse_package_with_default(default_name)

@@ -1518,6 +1518,7 @@ fn p_expr<'a>() -> impl Parser<'a, TokenStream<'a>, CExpr, ParserExtra<'a>> + Cl
             |acc, op| match op {
                 SuffixOp::Select(field) => CExpr::Select(Box::new(acc), field, Span::DUMMY),
                 SuffixOp::Index(idx) => CExpr::Index {
+                    pos: Position::unknown(),
                     expr: Box::new(acc),
                     index: Box::new(idx),
                     span: Span::DUMMY,

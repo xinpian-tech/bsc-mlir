@@ -547,6 +547,7 @@ impl<'src> BsvParser<'src> {
                 let end_span = self.current_span();
                 let full_span = Span::new(start_span.start, end_span.end);
                 expr = CExpr::Index {
+                    pos: crate::lookup_position(start_span.start),
                     expr: Box::new(expr),
                     index: Box::new(index_expr),
                     span: full_span,
@@ -966,7 +967,7 @@ impl<'src> BsvParser<'src> {
         let mut statements = Vec::new();
 
         // Parse imperative statements until endaction
-        while !self.check(&TokenKind::Id("endaction".into())) && !self.is_eof() {
+        while !self.check(&TokenKind::KwEndaction) && !self.is_eof() {
             // Skip empty statements (just semicolons)
             if self.check(&TokenKind::SymSemi) {
                 self.advance();
@@ -989,7 +990,7 @@ impl<'src> BsvParser<'src> {
         let mut statements = Vec::new();
 
         // Parse imperative statements until endactionvalue
-        while !self.check(&TokenKind::Id("endactionvalue".into())) && !self.is_eof() {
+        while !self.check(&TokenKind::KwEndactionvalue) && !self.is_eof() {
             // Skip empty statements (just semicolons)
             if self.check(&TokenKind::SymSemi) {
                 self.advance();
@@ -1177,7 +1178,7 @@ impl<'src> BsvParser<'src> {
                 self.advance(); // consume 'action'
                 let mut stmts = Vec::new();
 
-                while !self.check(&TokenKind::Id("endaction".into())) && !self.is_eof() {
+                while !self.check(&TokenKind::KwEndaction) && !self.is_eof() {
                     if self.check(&TokenKind::SymSemi) {
                         self.advance();
                         continue;

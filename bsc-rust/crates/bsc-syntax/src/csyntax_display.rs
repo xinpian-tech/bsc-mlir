@@ -626,7 +626,7 @@ impl Display for CExpr {
                 fmt_list(f, args)
             }
             CExpr::Infix(l, op, r, _) => {
-                write!(f, "CApply (CVar {}) [{},{}]", op, l, r)
+                write!(f, "CBinOp ({}) {} ({})", l, op, r)
             }
             CExpr::OperChain(operands, _) => {
                 write!(f, "COper ")?;
@@ -705,8 +705,8 @@ impl Display for CExpr {
                 fmt_position(f, position)?;
                 write!(f, " {}", kind)
             }
-            CExpr::Index { expr, index, .. } => {
-                write!(f, "CSub ({}) ({})", expr, index)
+            CExpr::Index { pos, expr, index, .. } => {
+                write!(f, "CSub {} ({}) ({})", pos, expr, index)
             }
             CExpr::IndexRange { expr, hi, lo, .. } => {
                 write!(f, "CSub2 ({}) ({}) ({})", expr, hi, lo)
@@ -903,7 +903,7 @@ impl Display for CStmt {
             CStmt::BindT { pattern, instance_name, pragmas, ty, expr, .. } => {
                 write!(f, "CSBindT ({}) ", pattern)?;
                 match instance_name {
-                    Some(e) => write!(f, "(Just {}) ", e)?,
+                    Some(e) => write!(f, "(Just ({})) ", e)?,
                     None => write!(f, "Nothing ")?,
                 }
                 fmt_pos_pprop_list(f, pragmas)?;
@@ -912,7 +912,7 @@ impl Display for CStmt {
             CStmt::Bind { pattern, instance_name, pragmas, expr, .. } => {
                 write!(f, "CSBind ({}) ", pattern)?;
                 match instance_name {
-                    Some(e) => write!(f, "(Just {}) ", e)?,
+                    Some(e) => write!(f, "(Just ({})) ", e)?,
                     None => write!(f, "Nothing ")?,
                 }
                 fmt_pos_pprop_list(f, pragmas)?;
@@ -929,7 +929,7 @@ impl Display for CStmt {
             CStmt::Expr { instance_name, expr, .. } => {
                 write!(f, "CSExpr ")?;
                 match instance_name {
-                    Some(e) => write!(f, "(Just {}) ", e)?,
+                    Some(e) => write!(f, "(Just ({})) ", e)?,
                     None => write!(f, "Nothing ")?,
                 }
                 write!(f, "({})", expr)
@@ -1227,7 +1227,7 @@ impl Display for CType {
                 write!(f, "}})")
             }
             CType::Fun(a, b, _) => {
-                write!(f, "TAp (TAp (TCon (TyCon {{tcon_name = Prelude::->, tcon_kind = Nothing, tcon_sort = TIabstract}})) ({})) ({})", a, b)
+                write!(f, "TAp (TAp (TCon (TyCon {{tcon_name = Prelude::->, tcon_kind = Just (Kfun KStar (Kfun KStar KStar)), tcon_sort = TIabstract}})) ({})) ({})", a, b)
             }
             CType::Forall(params, body, _) => {
                 write!(f, "TForall ")?;
