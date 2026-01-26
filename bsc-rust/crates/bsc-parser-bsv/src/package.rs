@@ -387,7 +387,13 @@ pub fn parse_package<'a>(
         )
         .then_ignore(
             // Optional endpackage (only required if package was specified)
-            keyword(TokenKind::KwEndpackage).or_not(),
+            keyword(TokenKind::KwEndpackage)
+                .then_ignore(
+                    symbol(TokenKind::SymColon)
+                        .ignore_then(word())
+                        .or_not(),
+                )
+                .or_not(),
         )
         .then_ignore(end())
         .validate(move |(pkg_name, stmts): (Option<Id>, Vec<ImperativeStatement>), e, emitter| {

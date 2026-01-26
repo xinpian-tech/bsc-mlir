@@ -475,7 +475,7 @@ impl<'src> BsvParser<'src> {
         // In BSV, function types are right-associative
         let mut func_type = return_type;
         for arg_type in arg_types.into_iter().rev() {
-            func_type = CType::Fun(Box::new(arg_type), Box::new(func_type), Span::DUMMY);
+            func_type = crate::make_fn_type(arg_type, func_type);
         }
 
         Ok(func_type)

@@ -135,7 +135,7 @@ impl<'src> BsvParser<'src> {
             result_type
         } else {
             param_types.into_iter().rev().fold(result_type, |acc, param_ty| {
-                CType::Fun(Box::new(param_ty), Box::new(acc), Span::DUMMY)
+                crate::make_fn_type(param_ty, acc)
             })
         };
 
@@ -412,7 +412,7 @@ impl<'src> BsvParser<'src> {
         } else {
             // Build function type: arg1 -> arg2 -> ... -> rettype
             arg_types.into_iter().rev().fold(ret_type, |acc, arg_type| {
-                CType::Fun(Box::new(arg_type), Box::new(acc), Span::DUMMY)
+                crate::make_fn_type(arg_type, acc)
             })
         };
 
@@ -872,7 +872,7 @@ impl<'src> BsvParser<'src> {
             ret_type
         } else {
             arg_types.into_iter().rev().fold(ret_type, |acc, arg_type| {
-                CType::Fun(Box::new(arg_type), Box::new(acc), Span::DUMMY)
+                crate::make_fn_type(arg_type, acc)
             })
         };
 

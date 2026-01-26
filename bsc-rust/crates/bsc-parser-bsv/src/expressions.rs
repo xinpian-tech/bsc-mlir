@@ -917,8 +917,11 @@ impl<'src> BsvParser<'src> {
     /// This implements the precedence climbing algorithm to handle operator
     /// precedence and associativity correctly.
     fn parse_precedence_expr(&mut self, min_prec: u8) -> Result<CExpr, ParseError> {
-        let mut left = self.parse_prefix_expr()?;
+        let left = self.parse_prefix_expr()?;
+        self.continue_precedence_expr(left, min_prec)
+    }
 
+    fn continue_precedence_expr(&mut self, mut left: CExpr, min_prec: u8) -> Result<CExpr, ParseError> {
         while let Some((prec, is_left_assoc, op_name)) = self.get_binary_op_info(self.current_kind()) {
             if prec < min_prec {
                 break;
@@ -936,6 +939,10 @@ impl<'src> BsvParser<'src> {
         }
 
         Ok(left)
+    }
+
+    pub fn complete_expr_from_primary(&mut self, primary: CExpr) -> Result<CExpr, ParseError> {
+        self.continue_precedence_expr(primary, 0)
     }
 
     /// Parse prefix expressions (unary operators).
@@ -1213,62 +1220,81 @@ impl<'src> BsvParser<'src> {
                 }
             },
 
-            // Variable assignment or method call
             TokenKind::Id(_) => {
-                // Parse as an expression first to handle complex left-hand sides
-                let expr = self.parse_expr()?;
+                let primary = self.parse_primary()?;
 
-                // Check what follows to determine statement type
                 match &self.current().kind {
-                    // Assignment: var = expr;
                     TokenKind::SymEq => {
-                        self.advance(); // consume '='
+                        self.advance();
                         let rhs = self.parse_expr()?;
                         self.expect(&TokenKind::SymSemi)?;
 
-                        // Convert expression to assignment
-                        if let CExpr::Var(var_id) = expr {
+                        if let CExpr::Var(var_id) = primary {
                             Ok(ImperativeStatement::Equal { name: var_id, expr: rhs })
                         } else {
-                            Ok(ImperativeStatement::NakedExpr(expr))
+                            Ok(ImperativeStatement::NakedExpr(primary))
                         }
                     },
 
-                    // Bind statement: var <- expr;
                     TokenKind::SymLArrow => {
-                        self.advance(); // consume '<-'
+                        self.advance();
                         let rhs = self.parse_expr()?;
                         self.expect(&TokenKind::SymSemi)?;
 
-                        // Convert expression to bind
-                        if let CExpr::Var(var_id) = expr {
+                        if let CExpr::Var(var_id) = primary {
                             Ok(ImperativeStatement::Bind { name: var_id, ty: None, expr: rhs })
                         } else {
-                            Ok(ImperativeStatement::NakedExpr(expr))
+                            Ok(ImperativeStatement::NakedExpr(primary))
                         }
                     },
 
-                    // Register write: var <= expr;
                     TokenKind::SymLtEq => {
-                        self.advance(); // consume '<='
+                        self.advance();
                         let rhs = self.parse_expr()?;
                         self.expect(&TokenKind::SymSemi)?;
 
-                        Ok(ImperativeStatement::RegWrite { lhs: expr, rhs })
+                        Ok(ImperativeStatement::RegWrite { lhs: primary, rhs })
                     },
 
-                    // Naked expression: expr;
                     TokenKind::SymSemi => {
-                        self.advance(); // consume ';'
-                        Ok(ImperativeStatement::NakedExpr(expr))
+                        self.advance();
+                        Ok(ImperativeStatement::NakedExpr(primary))
                     },
 
                     _ => {
-                        Err(ParseError::UnexpectedToken {
-                            expected: "=, <-, <=, or ;".to_string(),
-                            found: self.current_kind().name().to_string(),
-                            span: self.current_span().into(),
-                        })
+                        let expr = self.complete_expr_from_primary(primary)?;
+
+                        match &self.current().kind {
+                            TokenKind::SymEq => {
+                                self.advance();
+                                let rhs = self.parse_expr()?;
+                                self.expect(&TokenKind::SymSemi)?;
+                                Ok(ImperativeStatement::NakedExpr(expr))
+                            },
+                            TokenKind::SymLArrow => {
+                                self.advance();
+                                let rhs = self.parse_expr()?;
+                                self.expect(&TokenKind::SymSemi)?;
+                                Ok(ImperativeStatement::NakedExpr(expr))
+                            },
+                            TokenKind::SymLtEq => {
+                                self.advance();
+                                let rhs = self.parse_expr()?;
+                                self.expect(&TokenKind::SymSemi)?;
+                                Ok(ImperativeStatement::RegWrite { lhs: expr, rhs })
+                            },
+                            TokenKind::SymSemi => {
+                                self.advance();
+                                Ok(ImperativeStatement::NakedExpr(expr))
+                            },
+                            _ => {
+                                Err(ParseError::UnexpectedToken {
+                                    expected: "=, <-, <=, or ;".to_string(),
+                                    found: self.current_kind().name().to_string(),
+                                    span: self.current_span().into(),
+                                })
+                            }
+                        }
                     }
                 }
             },

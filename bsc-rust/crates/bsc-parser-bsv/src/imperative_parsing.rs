@@ -152,11 +152,12 @@ fn type_expr<'a>() -> impl Parser<'a, TokenStream<'a>, CType, ParserExtra<'a>> +
             Err(Rich::custom(span, "expected type constructor"))
         });
 
-        // Parse bit type: bit or bit[h:0]
         let bit_type = keyword(TokenKind::KwBit)
-            .ignore_then(
+            .map_with(|_, e| to_position(e.span()))
+            .then(
                 symbol(TokenKind::SymLBracket)
-                    .ignore_then(
+                    .map_with(|_, e| to_position(e.span()))
+                    .then(
                         any().try_map(|token: TokenKind, span| {
                             match token {
                                 TokenKind::Integer { value, .. } => {
@@ -182,16 +183,26 @@ fn type_expr<'a>() -> impl Parser<'a, TokenStream<'a>, CType, ParserExtra<'a>> +
                     .then_ignore(symbol(TokenKind::SymRBracket))
                     .or_not()
             )
-            .map_with(|high, e| {
-                let pos = to_position(e.span());
-                let bit_con = CType::Con(Id::qualified("Prelude", "Bit", pos.clone()).into());
-                let width = high.map_or(1, |h| h + 1);
-                let width_type = CType::Num(width, pos.clone());
-                CType::Apply(
-                    Box::new(bit_con),
-                    Box::new(width_type),
-                    to_span(e.span()),
-                )
+            .map_with(|(bit_pos, opt_range), e| {
+                let bit_con = CType::Con(Id::qualified("Prelude", "Bit", bit_pos.clone()).into());
+                match opt_range {
+                    Some((bracket_pos, high)) => {
+                        let width_type = CType::Num(high + 1, bracket_pos);
+                        CType::Apply(
+                            Box::new(bit_con),
+                            Box::new(width_type),
+                            to_span(e.span()),
+                        )
+                    }
+                    None => {
+                        let width_type = CType::Num(1, bit_pos);
+                        CType::Apply(
+                            Box::new(bit_con),
+                            Box::new(width_type),
+                            to_span(e.span()),
+                        )
+                    }
+                }
             });
 
         // Parse numeric type literals
@@ -425,11 +436,14 @@ fn interface_member<'a>() -> impl Parser<'a, TokenStream<'a>, CField, ParserExtr
 fn typedef_synonym<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CDefn>, ParserExtra<'a>> + Clone {
     type_expr()
         .then(constructor())
+        .then(typedef_params())
         .then_ignore(semicolon())
-        .map_with(|(original, name), e| {
+        .map_with(|((original, name), type_params), e| {
+            let (params, kinds): (Vec<Id>, Vec<CPartialKind>) = type_params.into_iter().unzip();
+            let idk = mk_idk(name, &kinds);
             vec![CDefn::Type(CTypeDef {
-                name: IdK::Plain(name),
-                params: Vec::new(),
+                name: idk,
+                params,
                 body: original,
                 span: to_span(e.span()),
             })]
@@ -498,6 +512,55 @@ fn typedef_enum<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CDefn>, ParserExtr
         .labelled("typedef enum")
 }
 
+fn typedef_param<'a>() -> impl Parser<'a, TokenStream<'a>, (Id, CPartialKind), ParserExtra<'a>> + Clone {
+    keyword(TokenKind::KwParameter).or_not()
+        .ignore_then(
+            choice((
+                any().try_map(|token: TokenKind, span| {
+                    if let TokenKind::Id(name) = &token {
+                        if name == "numeric" { return Ok(CPartialKind::Num); }
+                    }
+                    Err(Rich::custom(span, "expected 'numeric'"))
+                }),
+                keyword(TokenKind::KwString).to(CPartialKind::Str),
+            ))
+            .or_not()
+            .map(|opt| opt.unwrap_or(CPartialKind::NoInfo))
+        )
+        .then_ignore(keyword(TokenKind::KwType))
+        .then(word().map_with(|n, e| make_id(n, to_position(e.span()))))
+        .map(|(pkind, name)| (name, pkind))
+        .labelled("type parameter")
+}
+
+fn typedef_params<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<(Id, CPartialKind)>, ParserExtra<'a>> + Clone {
+    symbol(TokenKind::SymHash)
+        .ignore_then(
+            symbol(TokenKind::SymLParen)
+                .ignore_then(
+                    typedef_param()
+                        .separated_by(comma())
+                        .at_least(1)
+                        .collect::<Vec<_>>()
+                )
+                .then_ignore(symbol(TokenKind::SymRParen))
+        )
+        .or_not()
+        .map(|opt| opt.unwrap_or_default())
+        .labelled("typedef parameters")
+}
+
+fn mk_idk(name: Id, kinds: &[CPartialKind]) -> IdK {
+    if kinds.is_empty() || kinds.iter().all(|k| matches!(k, CPartialKind::NoInfo)) {
+        IdK::Plain(name)
+    } else {
+        let pkind = kinds.iter().rev().fold(CPartialKind::NoInfo, |acc, k| {
+            CPartialKind::Fun(Box::new(k.clone()), Box::new(acc))
+        });
+        IdK::WithPartialKind(name, pkind)
+    }
+}
+
 fn typedef_struct<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CDefn>, ParserExtra<'a>> + Clone {
     keyword(TokenKind::KwStruct)
         .ignore_then(
@@ -512,9 +575,12 @@ fn typedef_struct<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CDefn>, ParserEx
                 .then_ignore(symbol(TokenKind::SymRBrace))
         )
         .then(constructor())
+        .then(typedef_params())
         .then(parse_deriving())
         .then_ignore(semicolon())
-        .map_with(|((fields, name), derivs), e| {
+        .map_with(|(((fields, name), type_params), derivs), e| {
+            let (params, kinds): (Vec<Id>, Vec<CPartialKind>) = type_params.into_iter().unzip();
+            let idk = mk_idk(name, &kinds);
             let cfields: Vec<CField> = fields.into_iter().map(|(ty, field_name)| {
                 CField {
                     name: field_name,
@@ -532,8 +598,8 @@ fn typedef_struct<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CDefn>, ParserEx
             vec![CDefn::Struct(CStructDef {
                 visible: true,
                 sub_type: StructSubType::Struct,
-                name: IdK::Plain(name),
-                params: Vec::new(),
+                name: idk,
+                params,
                 fields: cfields,
                 deriving: derivs,
                 span: to_span(e.span()),
@@ -615,9 +681,12 @@ fn typedef_union<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CDefn>, ParserExt
                 .then_ignore(symbol(TokenKind::SymRBrace))
         )
         .then(constructor())
+        .then(typedef_params())
         .then(deriving_clause())
         .then_ignore(semicolon())
-        .map_with(|((constructors, name), derivings), e| {
+        .map_with(|(((constructors, name), type_params), derivings), e| {
+            let (params, kinds): (Vec<Id>, Vec<CPartialKind>) = type_params.into_iter().unzip();
+            let idk = mk_idk(name.clone(), &kinds);
             // Convert constructors to summands
             let mut original_summands = Vec::new();
             let mut internal_summands = Vec::new();
@@ -702,8 +771,8 @@ fn typedef_union<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CDefn>, ParserExt
             // Create the main data definition
             let mut defns = vec![CDefn::Data(CDataDef {
                 visible: true,
-                name: IdK::Plain(name),
-                params: Vec::new(),
+                name: idk,
+                params,
                 original_summands,
                 internal_summands,
                 deriving: derivings,
@@ -746,8 +815,12 @@ fn expr<'a>() -> impl Parser<'a, TokenStream<'a>, CExpr, ParserExtra<'a>> + Clon
             .map(|con| CExpr::Con(con, vec![], Span::DUMMY));
 
         // pTaskIdentifier: Parse system identifiers like $finish -> CTaskApply
+        // Mirrors Haskell's cVar: task names become CTaskApply (CVar name) []
         let system_task = system_id()
-            .map_with(|name, e| CExpr::Var(make_id(name, to_position(e.span()))));
+            .map_with(|name, e| {
+                let id = make_id(name, to_position(e.span()));
+                CExpr::TaskApply(Box::new(CExpr::Var(id)), vec![], Span::DUMMY)
+            });
 
         // Parse integer literals (both Integer and Number tokens)
         // - TokenKind::Integer: simple integers like 42
@@ -851,8 +924,16 @@ fn expr<'a>() -> impl Parser<'a, TokenStream<'a>, CExpr, ParserExtra<'a>> + Clon
                 .ignore_then(primary.clone())
                 .map_with(|e, ctx| {
                     let pos = to_position(ctx.span());
-                    let op_id = Id::qualified("Prelude", "negate", pos);
-                    CExpr::Apply(Box::new(CExpr::Var(op_id)), vec![e], Span::DUMMY)
+                    match e {
+                        CExpr::Lit(Literal::Integer(mut int_lit), _) => {
+                            int_lit.value = -int_lit.value;
+                            CExpr::Lit(Literal::Integer(int_lit), pos)
+                        }
+                        other => {
+                            let op_id = Id::qualified("Prelude", "negate", pos);
+                            CExpr::Apply(Box::new(CExpr::Var(op_id)), vec![other], Span::DUMMY)
+                        }
+                    }
                 }),
             primary.clone(),
         )).boxed();
@@ -926,10 +1007,28 @@ fn expr<'a>() -> impl Parser<'a, TokenStream<'a>, CExpr, ParserExtra<'a>> + Clon
             suffix.repeated(),
             |e, suf| match suf {
                 Suffix::Field(field) => CExpr::Select(Box::new(e), field, Span::DUMMY),
-                Suffix::Args(args) => CExpr::Apply(Box::new(e), args, Span::DUMMY),
+                Suffix::Args(args) => if args.is_empty() {
+                    e
+                } else {
+                    match e {
+                        CExpr::TaskApply(f, mut es, span) => {
+                            es.extend(args);
+                            CExpr::TaskApply(f, es, span)
+                        }
+                        CExpr::Apply(f, mut es, span) => {
+                            es.extend(args);
+                            CExpr::Apply(f, es, span)
+                        }
+                        CExpr::Con(id, mut es, span) => {
+                            es.extend(args);
+                            CExpr::Con(id, es, span)
+                        }
+                        other => CExpr::Apply(Box::new(other), args, Span::DUMMY),
+                    }
+                },
                 Suffix::BitSel(pos, index) => CExpr::Index { pos, expr: Box::new(e), index: Box::new(index), span: Span::DUMMY },
                 Suffix::BitSelRange(hi, lo) => CExpr::IndexRange { expr: Box::new(e), hi: Box::new(hi), lo: Box::new(lo), span: Span::DUMMY },
-                Suffix::Params(params) => CExpr::Apply(Box::new(e), params, Span::DUMMY),
+                Suffix::Params(params) => if params.is_empty() { e } else { CExpr::Apply(Box::new(e), params, Span::DUMMY) },
             },
         );
 
@@ -1070,21 +1169,14 @@ fn module_inst_arrow<'a>() -> impl Parser<'a, TokenStream<'a>, ImperativeStateme
         .then_ignore(symbol(TokenKind::SymLArrow))
         .then(expr())
         .then_ignore(semicolon())
-        .map_with(|((ifc_type, ifc_var), constructor), e| {
-            let ifc_var_clone = ifc_var.clone(); // Clone before moving
-            ImperativeStatement::Inst {
-                pos: to_position(e.span()),
-                attrs: Vec::new(),
-                ifc_var,
-                inst_var: ifc_var_clone, // For arrow syntax, instance and interface vars are same
-                ifc_type: Some(ifc_type),
-                clocked_by: None,
-                reset_by: None,
-                powered_by: None,
-                constructor,
+        .map(|((ifc_type, ifc_var), constructor)| {
+            ImperativeStatement::Bind {
+                name: ifc_var,
+                ty: Some(ifc_type),
+                expr: constructor,
             }
         })
-        .labelled("module instantiation with arrow")
+        .labelled("typed bind with arrow")
 }
 
 /// Parse old-style instantiation: mkModule instName(interfaces);
@@ -1119,6 +1211,31 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
             .then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
             .map(|(ty, name)| (name, ty));
 
+        let portlike_arg = parse_attributes()
+            .then(type_expr())
+            .then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
+            .map(|((attrs, ty), name)| (name, ty, attrs));
+
+        let simple_ifc = symbol(TokenKind::SymLParen)
+            .ignore_then(type_expr().or_not())
+            .then_ignore(symbol(TokenKind::SymRParen))
+            .map(|ty| (Vec::<(Id, CType)>::new(), ty));
+
+        let portlike_ifc = symbol(TokenKind::SymLParen)
+            .ignore_then(
+                portlike_arg
+                    .separated_by(comma())
+                    .at_least(1)
+                    .collect::<Vec<_>>()
+            )
+            .then_ignore(symbol(TokenKind::SymRParen))
+            .map(|mut ports: Vec<(Id, CType, Vec<SmolStr>)>| {
+                let last = ports.pop().unwrap();
+                let ifc_type = last.1;
+                let args: Vec<(Id, CType)> = ports.into_iter().map(|(n, t, _)| (n, t)).collect();
+                (args, Some(ifc_type))
+            });
+
         let module_def = keyword(TokenKind::KwModule)
             .ignore_then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
             .then(
@@ -1136,11 +1253,19 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                     .map(|opt| opt.unwrap_or_default())
             )
             .then(
-                symbol(TokenKind::SymLParen)
-                    .ignore_then(type_expr().or_not())
-                    .then_ignore(symbol(TokenKind::SymRParen))
+                simple_ifc.or(portlike_ifc)
                     .or_not()
-                    .map(|opt| opt.flatten())
+                    .map(|opt| opt.unwrap_or((vec![], None)))
+            )
+            .then(
+                keyword(TokenKind::KwProvisos)
+                    .ignore_then(
+                        symbol(TokenKind::SymLParen)
+                            .ignore_then(proviso().separated_by(comma()).collect::<Vec<_>>())
+                            .then_ignore(symbol(TokenKind::SymRParen))
+                    )
+                    .or_not()
+                    .map(|opt| opt.unwrap_or_default())
             )
             .then_ignore(semicolon())
             .then(stmt.clone().repeated().collect::<Vec<_>>())
@@ -1152,12 +1277,14 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                             .or_not()
                     )
             )
-            .map_with(|(((name, _params), ifc_type), body), e| {
+            .map_with(|((((name, static_params), (port_args, ifc_type)), provisos), body), e| {
                 use crate::imperative::build_module_body_expr;
                 let pos = to_position(e.span());
                 let default_ifc = ifc_type.clone().unwrap_or_else(|| {
                     CType::Con(Id::qualified("Prelude", "Empty", Position::unknown()).into())
                 });
+                let mut all_params: Vec<(Id, CType)> = static_params;
+                all_params.extend(port_args);
                 let m_tyvar = CType::Var(Id::new(SmolStr::new_static("_m__"), Position::unknown()));
                 let c_tyvar = CType::Var(Id::new(SmolStr::new_static("_c__"), Position::unknown()));
                 let result_type = CType::Apply(
@@ -1165,19 +1292,30 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                     Box::new(default_ifc.clone()),
                     Span::DUMMY,
                 );
+                let param_types: Vec<CType> = all_params.iter().map(|(_, t)| t.clone()).collect();
+                let full_type = if param_types.is_empty() {
+                    result_type
+                } else {
+                    param_types.into_iter().rev().fold(result_type, |acc, param_ty| {
+                        crate::make_fn_type(param_ty, acc)
+                    })
+                };
                 let is_module_pred = CPred {
                     class: Id::qualified("Prelude", "IsModule", Position::unknown()),
                     args: vec![m_tyvar, c_tyvar],
                     span: Span::DUMMY,
                 };
+                let mut all_context = vec![is_module_pred];
+                all_context.extend(provisos);
                 let module_type = CQType {
-                    context: vec![is_module_pred],
-                    ty: result_type,
+                    context: all_context,
+                    ty: full_type,
                     span: Span::DUMMY,
                 };
                 let body_expr = build_module_body_expr(pos.clone(), Some(default_ifc.clone()), body);
+                let patterns: Vec<CPat> = all_params.iter().map(|(n, _)| CPat::Var(n.clone())).collect();
                 let def_clause = CClause {
-                    patterns: vec![],
+                    patterns,
                     qualifiers: vec![],
                     body: body_expr,
                     span: Span::DUMMY,
@@ -1294,6 +1432,7 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                     .or_not()
             )
             .then_ignore(semicolon())
+            .then(empty().map_with(|_, e| to_position(e.span())))
             .then(stmt.clone().repeated().collect::<Vec<_>>())
             .then_ignore(
                 keyword(TokenKind::KwEndrule)
@@ -1303,12 +1442,12 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                             .or_not()
                     )
             )
-            .map_with(|((name, guard), body), e| {
+            .map_with(|(((name, guard), body_pos), body), e| {
                 ImperativeStatement::Rule {
                     pos: to_position(e.span()),
                     name,
                     guard,
-                    body_pos: to_position(e.span()),
+                    body_pos,
                     body,
                 }
             })
@@ -1472,7 +1611,55 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
             })
             .labelled("for statement");
 
-        let reg_write = expr()
+        #[derive(Clone)]
+        enum RegSuffix {
+            Field(Id),
+            Args(Vec<CExpr>),
+            Index(Position, CExpr),
+            Range(CExpr, CExpr),
+        }
+
+        let reg_write_lhs = choice((
+            word().map_with(|name, e| CExpr::Var(make_id(name, to_position(e.span())))),
+            symbol(TokenKind::SymLParen)
+                .ignore_then(expr())
+                .then_ignore(symbol(TokenKind::SymRParen)),
+        )).foldl(
+            choice((
+                symbol(TokenKind::SymDot)
+                    .ignore_then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
+                    .map(RegSuffix::Field),
+                symbol(TokenKind::SymLParen)
+                    .ignore_then(
+                        expr()
+                            .separated_by(comma())
+                            .collect::<Vec<_>>()
+                    )
+                    .then_ignore(symbol(TokenKind::SymRParen))
+                    .map(RegSuffix::Args),
+                symbol(TokenKind::SymLBracket)
+                    .map_with(|_, e| crate::lookup_position(e.span().start))
+                    .then(expr())
+                    .then(
+                        symbol(TokenKind::SymColon)
+                            .ignore_then(expr())
+                            .or_not()
+                    )
+                    .then_ignore(symbol(TokenKind::SymRBracket))
+                    .map(|((pos, idx), opt_hi)| match opt_hi {
+                        Some(hi) => RegSuffix::Range(idx, hi),
+                        None => RegSuffix::Index(pos, idx),
+                    }),
+            )).repeated(),
+            |e, suf| match suf {
+                RegSuffix::Field(f) => CExpr::Select(Box::new(e), f, Span::DUMMY),
+                RegSuffix::Args(args) => CExpr::Apply(Box::new(e), args, Span::DUMMY),
+                RegSuffix::Index(pos, idx) => CExpr::Index { pos, expr: Box::new(e), index: Box::new(idx), span: Span::DUMMY },
+                RegSuffix::Range(hi, lo) => CExpr::IndexRange { expr: Box::new(e), hi: Box::new(hi), lo: Box::new(lo), span: Span::DUMMY },
+            },
+        );
+
+        let reg_write = reg_write_lhs
             .then_ignore(symbol(TokenKind::SymLtEq))
             .then(expr())
             .then_ignore(semicolon())
@@ -1629,12 +1816,14 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
             .collect::<Vec<_>>()
             .then_ignore(symbol(TokenKind::SymColon))
             .then(stmt.clone().repeated().at_least(1).collect::<Vec<_>>())
-            .map(|(conds, body)| (conds, body))
+            .map_with(|(conds, body), e| (to_position(e.span()), conds, body))
             .labelled("case arm");
 
         let case_default = keyword(TokenKind::KwDefault)
-            .ignore_then(symbol(TokenKind::SymColon).or_not())
-            .ignore_then(stmt.clone().repeated().at_least(1).collect::<Vec<_>>())
+            .map_with(|_, e| to_position(e.span()))
+            .then_ignore(symbol(TokenKind::SymColon).or_not())
+            .then(stmt.clone().repeated().at_least(1).collect::<Vec<_>>())
+            .map(|(pos, stmts)| (pos, stmts))
             .labelled("case default");
 
         let case_stmt = keyword(TokenKind::KwCase)
@@ -1905,17 +2094,25 @@ fn attach_attributes_to_stmt(attrs: Vec<SmolStr>, stmt: ImperativeStatement) -> 
     }
 
     let has_synthesize = attrs.iter().any(|a| a == "synthesize");
+    let has_always_ready = attrs.iter().any(|a| a == "always_ready");
 
     match stmt {
         ImperativeStatement::ModuleDefn { pos, name, module_type, def_clause, .. } => {
-            let pragma = if has_synthesize {
-                Some(CPragma::Properties(
-                    name.clone(),
-                    vec![CPragmaProperty {
-                        name: "verilog".to_string(),
-                        value: None,
-                    }],
-                ))
+            let mut props = Vec::new();
+            if has_synthesize {
+                props.push(CPragmaProperty {
+                    name: "verilog".to_string(),
+                    value: None,
+                });
+            }
+            if has_always_ready {
+                props.push(CPragmaProperty {
+                    name: "alwaysReady".to_string(),
+                    value: None,
+                });
+            }
+            let pragma = if !props.is_empty() {
+                Some(CPragma::Properties(name.clone(), props))
             } else {
                 None
             };

@@ -535,8 +535,18 @@ impl Display for IdK {
                 write!(f, "IdKind {} ", id)?;
                 fmt_kind_as_arg(f, k)
             }
-            IdK::WithPartialKind(id, pk) => write!(f, "IdPKind {} {}", id, pk),
+            IdK::WithPartialKind(id, pk) => {
+                write!(f, "IdPKind {} ", id)?;
+                fmt_partial_kind_as_arg(f, pk)
+            }
         }
+    }
+}
+
+fn fmt_partial_kind_as_arg(f: &mut Formatter<'_>, pk: &CPartialKind) -> fmt::Result {
+    match pk {
+        CPartialKind::Fun(_, _) => write!(f, "({})", pk),
+        _ => write!(f, "{}", pk),
     }
 }
 
@@ -1349,6 +1359,8 @@ impl Display for CPragmaProperty {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match (self.name.as_str(), &self.value) {
             ("verilog", _) => write!(f, "PPverilog"),
+            ("alwaysReady", None) => write!(f, "PPalwaysReady []"),
+            ("alwaysEnabled", None) => write!(f, "PPalwaysEnabled []"),
             ("deprecate", Some(msg)) => write!(f, "PPdeprecate {:?}", msg),
             ("deprecate", None) => write!(f, "PPdeprecate \"\""),
             (name, Some(val)) => write!(f, "PP{} {:?}", name, val),

@@ -30,6 +30,8 @@ use bsc_syntax::{
     CDefn, CExpr, CPackage, CPat, CType, CDef, CQType, CClause, CPragma, CStructDef,
     StructSubType, IdK, CField, CValueDef
 };
+use bsc_syntax::csyntax::{CKind, CTyCon, CTyConSort};
+use bsc_syntax::id::Id;
 use crate::imperative::ImperativeStatement;
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -57,6 +59,33 @@ pub fn lookup_position(span_start: u32) -> Position {
 
 /// Result type for parser operations.
 pub type ParseResult<T> = Result<T, ParseError>;
+
+pub fn make_fn_type(arg: CType, ret: CType) -> CType {
+    let arrow_kind = CKind::Fun(
+        Box::new(CKind::Star(Span::DUMMY)),
+        Box::new(CKind::Fun(
+            Box::new(CKind::Star(Span::DUMMY)),
+            Box::new(CKind::Star(Span::DUMMY)),
+            Span::DUMMY,
+        )),
+        Span::DUMMY,
+    );
+    let arrow_tycon = CTyCon::full(
+        Id::qualified("Prelude", "->", Position::unknown()),
+        Some(arrow_kind),
+        CTyConSort::Abstract,
+    );
+    let arrow = CType::Con(arrow_tycon);
+    CType::Apply(
+        Box::new(CType::Apply(
+            Box::new(arrow),
+            Box::new(arg),
+            Span::DUMMY,
+        )),
+        Box::new(ret),
+        Span::DUMMY,
+    )
+}
 
 /// BSV parser state.
 ///
