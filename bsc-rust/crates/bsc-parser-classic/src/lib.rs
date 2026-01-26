@@ -824,7 +824,7 @@ fn p_kind<'a>() -> impl Parser<'a, TokenStream<'a>, CKind, ParserExtra<'a>> + Cl
 fn p_type<'a>() -> impl Parser<'a, TokenStream<'a>, CType, ParserExtra<'a>> + Clone {
     recursive(|ty| {
         let tyvar = p_tyvar_id().map(CType::Var);
-        let tycon = p_tycon_id().map(CType::Con);
+        let tycon = p_tycon_id().map(|id| CType::Con(id.into()));
 
         let num_type = integer().map(|(_, _, value, _span, pos)| {
             let v: i128 = value.to_string().parse().unwrap_or(0);
@@ -841,7 +841,7 @@ fn p_type<'a>() -> impl Parser<'a, TokenStream<'a>, CType, ParserExtra<'a>> + Cl
             .delimited_by(lparen(), rparen())
             .map(|ts| {
                 if ts.is_empty() {
-                    CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()))
+                    CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()).into())
                 } else if ts.len() == 1 {
                     CType::Paren(Box::new(ts.into_iter().next().unwrap()), Span::DUMMY)
                 } else {
@@ -909,7 +909,7 @@ fn p_qtype<'a>() -> impl Parser<'a, TokenStream<'a>, CQType, ParserExtra<'a>> + 
 fn p_atype<'a>() -> impl Parser<'a, TokenStream<'a>, CType, ParserExtra<'a>> + Clone {
     recursive(|_| {
         let tyvar = p_tyvar_id().map(CType::Var);
-        let tycon = p_tycon_id().map(CType::Con);
+        let tycon = p_tycon_id().map(|id| CType::Con(id.into()));
 
         let num_type = integer().map(|(_, _, value, _span, pos)| {
             let v: i128 = value.to_string().parse().unwrap_or(0);
@@ -924,7 +924,7 @@ fn p_atype<'a>() -> impl Parser<'a, TokenStream<'a>, CType, ParserExtra<'a>> + C
             .delimited_by(lparen(), rparen())
             .map(|ts| {
                 if ts.is_empty() {
-                    CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()))
+                    CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()).into())
                 } else if ts.len() == 1 {
                     CType::Paren(Box::new(ts.into_iter().next().unwrap()), Span::DUMMY)
                 } else {
@@ -1293,7 +1293,7 @@ fn p_expr<'a>() -> impl Parser<'a, TokenStream<'a>, CExpr, ParserExtra<'a>> + Cl
             .map(|(pos, ty)| {
                 let valueof_id = Id::qualified("Prelude", "primValueOf", pos.clone());
                 // Haskell: idBit = prelude_id_no fsBit (uses noPosition)
-                let bit_tycon = CType::Con(Id::qualified("Prelude", "Bit", Position::unknown()));
+                let bit_tycon = CType::Con(Id::qualified("Prelude", "Bit", Position::unknown()).into());
                 let bit_ty = CType::Apply(Box::new(bit_tycon), Box::new(ty), Span::DUMMY);
                 let qtype = CQType { context: vec![], ty: bit_ty, span: Span::DUMMY };
                 // Haskell: anyExprAt pos = CAny pos UDontCare
@@ -1307,7 +1307,7 @@ fn p_expr<'a>() -> impl Parser<'a, TokenStream<'a>, CExpr, ParserExtra<'a>> + Cl
             .map(|(pos, ty)| {
                 let stringof_id = Id::qualified("Prelude", "primStringOf", pos.clone());
                 // Haskell: idStringProxy = prelude_id_no fsStringProxy (uses noPosition)
-                let proxy_tycon = CType::Con(Id::qualified("Prelude", "StringProxy", Position::unknown()));
+                let proxy_tycon = CType::Con(Id::qualified("Prelude", "StringProxy", Position::unknown()).into());
                 let proxy_ty = CType::Apply(Box::new(proxy_tycon), Box::new(ty), Span::DUMMY);
                 let qtype = CQType { context: vec![], ty: proxy_ty, span: Span::DUMMY };
                 // Haskell: anyExprAt pos = CAny pos UDontCare
@@ -2280,7 +2280,7 @@ fn compute_data_summands(
 
         let arg_type = match &summand.arg_types[..] {
             [] => {
-                CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()))
+                CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()).into())
             }
             [single_qtype] if is_positional && single_qtype.context.is_empty() => {
                 single_qtype.ty.clone()
@@ -2304,7 +2304,7 @@ fn compute_data_summands(
                 });
                 struct_defs.push(struct_def);
 
-                let base_type = CType::Con(struct_type_name);
+                let base_type = CType::Con(struct_type_name.into());
                 type_params.iter().fold(base_type, |acc, param| {
                     CType::Apply(
                         Box::new(acc),
@@ -3185,8 +3185,8 @@ fn x_classic_module_verilog(
     let id_expose_current_reset = Id::qualified("Prelude", "exposeCurrentReset", Position::unknown());
     let id_clock_type = Id::qualified("Prelude", "Clock", Position::unknown());
     let id_reset_type = Id::qualified("Prelude", "Reset", Position::unknown());
-    let t_clock = CType::Con(id_clock_type);
-    let t_reset = CType::Con(id_reset_type);
+    let t_clock = CType::Con(CTyCon::with_kind(id_clock_type, CKind::Star(Span::DUMMY)));
+    let t_reset = CType::Con(CTyCon::with_kind(id_reset_type, CKind::Star(Span::DUMMY)));
     let clock_names: Vec<Id> = (1..=clocks.len())
         .map(|i| Id::new(&format!("_clk__{}", i), Position::unknown()))
         .collect();

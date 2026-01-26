@@ -13,6 +13,34 @@ use bsc_syntax::id::Id;
 use bsc_syntax::Literal;
 use smol_str::SmolStr;
 
+fn get_naked_expr_name(expr: &CExpr) -> Option<CExpr> {
+    let id_def = match expr {
+        CExpr::Apply(func, _, _) => {
+            if let CExpr::Var(id) = func.as_ref() {
+                Some(id.clone())
+            } else {
+                None
+            }
+        }
+        CExpr::Var(id) => Some(id.clone()),
+        _ => None,
+    };
+    let id_def = id_def.filter(|id| id.name().as_str() != "_f__")?;
+    let display_name = id_def.name().clone();
+    let new_name = format!("_inst_{}", display_name);
+    let mut id_prime = id_def;
+    id_prime.set_name(new_name);
+    id_prime.add_prop(bsc_syntax::id::IdProp::Keep);
+    id_prime.set_naked_inst();
+    id_prime.set_display_name(display_name);
+    let name_expr = CExpr::Apply(
+        Box::new(CExpr::Var(Id::qualified("Prelude", "primGetName", id_prime.position()))),
+        vec![CExpr::Var(id_prime)],
+        Span::DUMMY,
+    );
+    Some(name_expr)
+}
+
 fn clet_seq(defls: Vec<CDefl>, body: CExpr) -> CExpr {
     if defls.is_empty() {
         return body;
@@ -491,9 +519,9 @@ fn build_function_type(params: Vec<(Id, Option<CType>)>, provisos: Vec<CPred>, r
 
 fn build_instance_type(class_name: Id, type_args: Vec<CType>, provisos: Vec<CPred>) -> CQType {
     let instance_ty = if type_args.is_empty() {
-        CType::Con(class_name)
+        CType::Con(class_name.into())
     } else {
-        let base = CType::Con(class_name);
+        let base = CType::Con(class_name.into());
         type_args.into_iter().fold(base, |acc, arg| {
             CType::Apply(Box::new(acc), Box::new(arg), Span::DUMMY)
         })
@@ -751,7 +779,7 @@ fn build_array_type(base_type: CType, num_dimensions: usize) -> CType {
         let mut array_con_id = Id::qualified("Prelude", "Array", Position::unknown());
         array_con_id.add_prop(bsc_syntax::id::IdProp::ParserGenerated);
         CType::Apply(
-            Box::new(CType::Con(array_con_id)),
+            Box::new(CType::Con(array_con_id.into())),
             Box::new(acc),
             Span::DUMMY,
         )
@@ -760,7 +788,7 @@ fn build_array_type(base_type: CType, num_dimensions: usize) -> CType {
 
 fn extract_interface_id(ty: &CType) -> Option<Id> {
     match ty {
-        CType::Con(tycon) => Some(tycon.clone()),
+        CType::Con(tycon) => Some(tycon.name.clone()),
         CType::Apply(inner, _, _) => extract_interface_id(inner),
         _ => None,
     }
@@ -810,7 +838,7 @@ fn convert_module_body_to_expr(stmts: Vec<ImperativeStatement>, pos: Position, i
             } => {
                 let is_action = ret_type.as_ref().map(|t| {
                     if let CType::Con(tycon) = t {
-                        tycon.name() == "Action"
+                        tycon.name.name() == "Action"
                     } else {
                         false
                     }
@@ -1023,8 +1051,9 @@ fn convert_module_body_to_expr(stmts: Vec<ImperativeStatement>, pos: Position, i
                 module_items.push(CModuleItem::Interface(ifc_expr));
             }
             ImperativeStatement::NakedExpr(expr) => {
+                let instance_name = get_naked_expr_name(&expr);
                 module_items.push(CModuleItem::Stmt(CStmt::Expr {
-                    instance_name: None,
+                    instance_name: instance_name.map(Box::new),
                     expr,
                     span: Span::DUMMY,
                 }));
@@ -1133,10 +1162,10 @@ fn convert_module_body_to_expr(stmts: Vec<ImperativeStatement>, pos: Position, i
             ImperativeStatement::SubinterfaceBody { name, ty, members, .. } => {
                 let sub_ifc_ty = ty.and_then(|t| {
                     if let CType::Con(tycon) = &t {
-                        Some(Id::unpositioned(tycon.name().clone()))
+                        Some(Id::unpositioned(tycon.name().name().clone()))
                     } else if let CType::Apply(base, _, _) = &t {
                         if let CType::Con(tycon) = base.as_ref() {
-                            Some(Id::unpositioned(tycon.name().clone()))
+                            Some(Id::unpositioned(tycon.name().name().clone()))
                         } else {
                             None
                         }
@@ -1346,7 +1375,7 @@ fn convert_interface_expr_with_pos_and_type(pos: Position, ty: Option<CType>, me
 
     let type_name = ty.and_then(|t| {
         if let CType::Con(tycon) = t {
-            Some(Id::unpositioned(tycon.name().clone()))
+            Some(Id::unpositioned(tycon.name().name().clone()))
         } else {
             None
         }
@@ -1418,10 +1447,10 @@ fn convert_interface_members_to_struct(members: Vec<ImperativeStatement>, type_n
             ImperativeStatement::SubinterfaceBody { name, ty: inner_ty, members: inner_members, .. } => {
                 let inner_type_name = inner_ty.and_then(|t| {
                     if let CType::Con(tycon) = &t {
-                        Some(Id::unpositioned(tycon.name().clone()))
+                        Some(Id::unpositioned(tycon.name().name().clone()))
                     } else if let CType::Apply(base, _, _) = &t {
                         if let CType::Con(tycon) = base.as_ref() {
-                            Some(Id::unpositioned(tycon.name().clone()))
+                            Some(Id::unpositioned(tycon.name().name().clone()))
                         } else {
                             None
                         }
@@ -1503,7 +1532,7 @@ fn convert_for_loop_to_expr_pure(
         return Vec::new();
     }
 
-    let integer_ty = CType::Con(Id::new(SmolStr::new_static("Integer"), Position::unknown()));
+    let integer_ty = CType::Con(Id::new(SmolStr::new_static("Integer"), Position::unknown()).into());
 
     let loop_vars: Vec<(Id, CType)> = init.iter().filter_map(|stmt| {
         if let ImperativeStatement::Decl { name, ty, .. } = stmt {
@@ -2301,7 +2330,7 @@ fn convert_for_loop_to_cstmts(
             name_with_keep.add_prop(bsc_syntax::id::IdProp::Keep);
 
             let ty = ty.clone().unwrap_or_else(|| {
-                CType::Con(Id::new(SmolStr::new_static("Integer"), Position::unknown()))
+                CType::Con(Id::new(SmolStr::new_static("Integer"), Position::unknown()).into())
             });
 
             result.push(CStmt::LetSeq(
@@ -2371,7 +2400,7 @@ fn convert_for_loop_to_cstmts(
         if let ImperativeStatement::Equal { name, expr } = stmt {
             let mut name_with_keep = name.clone();
             name_with_keep.add_prop(bsc_syntax::id::IdProp::Keep);
-            let ty = CType::Con(Id::new(SmolStr::new_static("Integer"), Position::unknown()));
+            let ty = CType::Con(Id::new(SmolStr::new_static("Integer"), Position::unknown()).into());
             while_body_stmts.push(CStmt::LetSeq(
                 vec![CDefl::ValueSign(
                     CDef::Untyped {
@@ -2433,9 +2462,9 @@ fn convert_for_loop_to_cstmts(
         Box::new(else_body),
     );
 
-    let loop_var_ty = CType::Con(Id::new(SmolStr::new_static("Integer"), Position::unknown()));
+    let loop_var_ty = CType::Con(Id::new(SmolStr::new_static("Integer"), Position::unknown()).into());
     let action_value_ty = CType::Apply(
-        Box::new(CType::Con(Id::qualified("Prelude", "ActionValue", Position::unknown()))),
+        Box::new(CType::Con(Id::qualified("Prelude", "ActionValue", Position::unknown()).into())),
         Box::new(loop_var_ty.clone()),
         Span::DUMMY,
     );
@@ -2521,7 +2550,7 @@ fn convert_for_loop_to_module_stmts(
         if let ImperativeStatement::Decl { name, ty, .. } = stmt {
             let ty = ty.clone().unwrap_or_else(|| {
                 CType::Apply(
-                    Box::new(CType::Con(Id::qualified("Prelude", "Int", name.position()))),
+                    Box::new(CType::Con(Id::qualified("Prelude", "Int", name.position()).into())),
                     Box::new(CType::Num(32, name.position())),
                     Span::DUMMY,
                 )
@@ -2570,7 +2599,7 @@ fn convert_for_loop_to_module_stmts(
         if !loop_vars.iter().any(|(v, _)| v.name() == var.name()) {
             let ty = var_types.get(var.name()).cloned().unwrap_or_else(|| {
                 CType::Apply(
-                    Box::new(CType::Con(Id::qualified("Prelude", "Int", var.position()))),
+                    Box::new(CType::Con(Id::qualified("Prelude", "Int", var.position()).into())),
                     Box::new(CType::Num(32, var.position())),
                     Span::DUMMY,
                 )
@@ -2631,7 +2660,7 @@ fn convert_for_loop_to_module_stmts(
 
             let ty = ty.clone().unwrap_or_else(|| {
                 CType::Apply(
-                    Box::new(CType::Con(Id::qualified("Prelude", "Int", name.position()))),
+                    Box::new(CType::Con(Id::qualified("Prelude", "Int", name.position()).into())),
                     Box::new(CType::Num(32, name.position())),
                     Span::DUMMY,
                 )
@@ -2747,14 +2776,14 @@ fn convert_for_loop_to_module_stmts(
 
 fn build_tuple_type(vars: &[(Id, CType)]) -> CType {
     match vars.len() {
-        0 => CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown())),
+        0 => CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()).into()),
         1 => vars[0].1.clone(),
         _ => {
             let first_ty = vars[0].1.clone();
             let rest_ty = build_tuple_type(&vars[1..]);
             CType::Apply(
                 Box::new(CType::Apply(
-                    Box::new(CType::Con(Id::qualified("Prelude", "PrimPair", Position::unknown()))),
+                    Box::new(CType::Con(Id::qualified("Prelude", "PrimPair", Position::unknown()).into())),
                     Box::new(first_ty),
                     Span::DUMMY,
                 )),
@@ -2814,7 +2843,7 @@ fn build_for_loop_inner_body(
                         .or_else(|| var_types.get(var_name.name()).cloned())
                         .unwrap_or_else(|| {
                             CType::Apply(
-                                Box::new(CType::Con(Id::qualified("Prelude", "Int", var_name.position()))),
+                                Box::new(CType::Con(Id::qualified("Prelude", "Int", var_name.position()).into())),
                                 Box::new(CType::Num(32, var_name.position())),
                                 Span::DUMMY,
                             )
@@ -2863,7 +2892,7 @@ fn build_for_loop_inner_body(
                 .map(|(_, t)| t.clone())
                 .unwrap_or_else(|| {
                     CType::Apply(
-                        Box::new(CType::Con(Id::qualified("Prelude", "Int", name.position()))),
+                        Box::new(CType::Con(Id::qualified("Prelude", "Int", name.position()).into())),
                         Box::new(CType::Num(32, name.position())),
                         Span::DUMMY,
                     )
@@ -3351,10 +3380,15 @@ fn conv_imperative_stmts_to_cstmts(
 
     let mut result = Vec::new();
     let len = stmts.len();
+    let mut has_return = false;
 
     for (i, stmt) in stmts.into_iter().enumerate() {
         let is_last = i == len - 1;
         let stmt_at_end = at_end && is_last;
+
+        if is_last && matches!(stmt, ImperativeStatement::Return { .. }) {
+            has_return = true;
+        }
 
         match stmt {
             ImperativeStatement::Decl { name, ty, init } => {
@@ -3486,7 +3520,7 @@ fn conv_imperative_stmts_to_cstmts(
             ImperativeStatement::MethodDefn { pos, name, ret_type, params, guard, body } => {
                 let is_action = ret_type.as_ref().map(|t| {
                     if let CType::Con(tycon) = t {
-                        tycon.name() == "Action"
+                        tycon.name.name() == "Action"
                     } else {
                         false
                     }
@@ -3551,8 +3585,13 @@ fn conv_imperative_stmts_to_cstmts(
                 });
             }
             ImperativeStatement::NakedExpr(expr) => {
+                let instance_name = if matches!(context, ImperativeStmtContext::ISCIsModule | ImperativeStmtContext::ISCModule) {
+                    get_naked_expr_name(&expr)
+                } else {
+                    None
+                };
                 result.push(CStmt::Expr {
-                    instance_name: None,
+                    instance_name: instance_name.map(Box::new),
                     expr,
                     span: Span::DUMMY,
                 });
@@ -3725,7 +3764,7 @@ fn conv_imperative_stmts_to_cstmts(
         }
     }
 
-    if at_end && matches!(context, ImperativeStmtContext::ISCIsModule | ImperativeStmtContext::ISCModule) {
+    if !has_return && at_end && matches!(context, ImperativeStmtContext::ISCIsModule | ImperativeStmtContext::ISCModule) {
         let ifc_id = ifc_type.as_ref().and_then(left_con);
         let ifc_expr = CExpr::Interface(Position::unknown(), ifc_id, vec![]);
         let return_expr = CExpr::Apply(
@@ -3817,21 +3856,16 @@ pub fn cstmts_to_cm_stmts(schedule_pragmas: Vec<CSchedulePragma>, cstmts: Vec<CS
     }
 
     match &last_stmt[0] {
-        CStmt::Expr { expr: CExpr::Apply(func, args, _), .. } => {
-            if args.len() == 1 {
-                if let CExpr::Interface(position, name, fields) = &args[0] {
-                    result.push(CModuleItem::Interface(CExpr::Interface(
-                        position.clone(),
-                        name.clone(),
-                        fields.clone(),
-                    )));
-                    return result;
+        CStmt::Expr { instance_name, expr, .. } if instance_name.is_none() => {
+            if let CExpr::Apply(_func, args, _) = expr {
+                if args.len() == 1 {
+                    result.push(CModuleItem::Interface(args[0].clone()));
+                } else {
+                    result.push(CModuleItem::Stmt(last_stmt[0].clone()));
                 }
+            } else {
+                result.push(CModuleItem::Stmt(last_stmt[0].clone()));
             }
-            result.push(CModuleItem::Stmt(last_stmt[0].clone()));
-        }
-        CStmt::Expr { expr, .. } => {
-            result.push(CModuleItem::Stmt(last_stmt[0].clone()));
         }
         _ => {
             result.push(CModuleItem::Stmt(last_stmt[0].clone()));
@@ -3844,12 +3878,20 @@ pub fn cstmts_to_cm_stmts(schedule_pragmas: Vec<CSchedulePragma>, cstmts: Vec<CS
 pub fn build_module_body_expr(pos: Position, ifc_type: Option<CType>, stmts: Vec<ImperativeStatement>) -> CExpr {
     let cstmts = imperative_to_cstmts(ImperativeStmtContext::ISCIsModule, ifc_type, stmts);
     let cm_stmts = cstmts_to_cm_stmts(vec![], cstmts);
-    CExpr::Module(pos, cm_stmts)
+    let fixed = cm_stmts.into_iter().map(|stmt| {
+        match stmt {
+            CModuleItem::Interface(CExpr::Interface(_, name, def)) => {
+                CModuleItem::Interface(CExpr::Interface(pos.clone(), name, def))
+            }
+            other => other,
+        }
+    }).collect();
+    CExpr::Module(pos, fixed)
 }
 
 fn left_con(ty: &CType) -> Option<Id> {
     match ty {
-        CType::Con(id) => Some(id.clone()),
+        CType::Con(tycon) => Some(tycon.name.clone()),
         CType::Apply(left, _, _) => left_con(left),
         _ => None,
     }

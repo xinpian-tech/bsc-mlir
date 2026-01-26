@@ -1204,14 +1204,8 @@ impl Display for CType {
             CType::Var(id) => {
                 write!(f, "TVar (TyVar {{tv_name = {}, tv_num = -1, tv_kind = KVar (-42)}})", id)
             }
-            CType::Con(id) => {
-                let id_str = format!("{}", id);
-                let kind_str = if id_str == "Prelude::Clock" || id_str == "Prelude::Reset" {
-                    "Just KStar"
-                } else {
-                    "Nothing"
-                };
-                write!(f, "TCon (TyCon {{tcon_name = {}, tcon_kind = {}, tcon_sort = TIabstract}})", id, kind_str)
+            CType::Con(tycon) => {
+                write!(f, "TCon ({})", tycon)
             }
             CType::Apply(a, b, _) => {
                 write!(f, "TAp ({}) ({})", a, b)
@@ -1227,7 +1221,7 @@ impl Display for CType {
                 write!(f, "}})")
             }
             CType::Fun(a, b, _) => {
-                write!(f, "TAp (TAp (TCon (TyCon {{tcon_name = Prelude::->, tcon_kind = Just (Kfun KStar (Kfun KStar KStar)), tcon_sort = TIabstract}})) ({})) ({})", a, b)
+                write!(f, "TAp (TAp (TCon (TyCon {{tcon_name = Prelude::->, tcon_kind = Nothing, tcon_sort = TIabstract}})) ({})) ({})", a, b)
             }
             CType::Forall(params, body, _) => {
                 write!(f, "TForall ")?;
@@ -1289,6 +1283,43 @@ impl Display for CKind {
                 fmt_kind_as_arg(f, b)
             }
             CKind::Paren(k, _) => write!(f, "{}", k),
+        }
+    }
+}
+
+impl Display for CTyCon {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "TyCon {{tcon_name = {}, tcon_kind = ", self.name)?;
+        match &self.kind {
+            Some(k) => write!(f, "Just {}", fmt_kind_for_tycon(k))?,
+            None => write!(f, "Nothing")?,
+        }
+        write!(f, ", tcon_sort = {}}}", self.sort)
+    }
+}
+
+fn fmt_kind_for_tycon(k: &CKind) -> String {
+    match k {
+        CKind::Star(_) | CKind::Num(_) | CKind::Str(_) => format!("{}", k),
+        CKind::Fun(_, _, _) => format!("({})", k),
+        CKind::Paren(inner, _) => fmt_kind_for_tycon(inner),
+    }
+}
+
+impl Display for CTyConSort {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            CTyConSort::Abstract => write!(f, "TIabstract"),
+            CTyConSort::TypeSyn(arity, ty) => write!(f, "TItype {} ({})", arity, ty),
+            CTyConSort::Data { constructors, is_enum } => {
+                write!(f, "TIdata ")?;
+                fmt_list(f, constructors)?;
+                write!(f, " {}", if *is_enum { "True" } else { "False" })
+            }
+            CTyConSort::Struct(sub_type, fields) => {
+                write!(f, "TIstruct {} ", sub_type)?;
+                fmt_list(f, fields)
+            }
         }
     }
 }

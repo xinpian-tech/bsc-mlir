@@ -864,7 +864,8 @@ impl<'a> Converter<'a> {
                     kind: IKind::Star,
                 }))
             }
-            CType::Con(name) => {
+            CType::Con(ref tycon) => {
+                let name = &tycon.name;
                 // Type constructor
                 if let Some(type_info) = self.symtab.find_type(name) {
                     let sort = match &type_info.sort {

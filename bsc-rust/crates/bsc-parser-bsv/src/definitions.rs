@@ -416,13 +416,8 @@ impl<'src> BsvParser<'src> {
             })
         };
 
-        // Extract argument names for pragmas
         let arg_names: Vec<Id> = args.iter().map(|(name, _)| name.clone()).collect();
-        let pragmas = if arg_names.is_empty() {
-            None
-        } else {
-            Some(vec![IfcPragma::ArgNames(arg_names)])
-        };
+        let pragmas = Some(vec![IfcPragma::ArgNames(arg_names)]);
 
         Ok(CField {
             name,
@@ -530,7 +525,7 @@ impl<'src> BsvParser<'src> {
             // Internal summand: single Unit type argument, actual encoding
             internal_summands.push(CInternalSummand {
                 names: vec![tag_name],
-                arg_type: CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown())),
+                arg_type: CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()).into()),
                 tag_encoding: tag_encoding.unwrap_or(0), // Use 0 if no encoding specified
             });
         }
@@ -667,7 +662,7 @@ impl<'src> BsvParser<'src> {
                     arg_type.clone()
                 } else {
                     // Use PrimUnit for void variants (like Haskell's idPrimUnit)
-                    CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()))
+                    CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()).into())
                 },
                 tag_encoding: tag_index as i64,  // Sequential encoding starting from 0
             };

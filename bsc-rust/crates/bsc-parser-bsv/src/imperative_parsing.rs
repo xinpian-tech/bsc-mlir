@@ -146,7 +146,7 @@ fn type_expr<'a>() -> impl Parser<'a, TokenStream<'a>, CType, ParserExtra<'a>> +
         let tycon = any().try_map(|token: TokenKind, span| {
             if let TokenKind::Id(name) = token {
                 if name.chars().next().unwrap_or('a').is_ascii_uppercase() {
-                    return Ok(CType::Con(make_id(name, to_position(span))));
+                    return Ok(CType::Con(make_id(name, to_position(span)).into()));
                 }
             }
             Err(Rich::custom(span, "expected type constructor"))
@@ -184,7 +184,7 @@ fn type_expr<'a>() -> impl Parser<'a, TokenStream<'a>, CType, ParserExtra<'a>> +
             )
             .map_with(|high, e| {
                 let pos = to_position(e.span());
-                let bit_con = CType::Con(Id::qualified("Prelude", "Bit", pos.clone()));
+                let bit_con = CType::Con(Id::qualified("Prelude", "Bit", pos.clone()).into());
                 let width = high.map_or(1, |h| h + 1);
                 let width_type = CType::Num(width, pos.clone());
                 CType::Apply(
@@ -226,7 +226,7 @@ fn type_expr<'a>() -> impl Parser<'a, TokenStream<'a>, CType, ParserExtra<'a>> +
             .map(|ts| {
                 if ts.is_empty() {
                     // Empty tuple () represents unit type
-                    CType::Con(Id::new("()", Position::unknown()))
+                    CType::Con(Id::new("()", Position::unknown()).into())
                 } else if ts.len() == 1 {
                     // Single parenthesized type
                     CType::Paren(Box::new(ts.into_iter().next().unwrap()), to_span(SimpleSpan::new((), 0..0)))
@@ -236,21 +236,56 @@ fn type_expr<'a>() -> impl Parser<'a, TokenStream<'a>, CType, ParserExtra<'a>> +
                 }
             });
 
-        // Parse Action type keyword
         let action_type = keyword(TokenKind::KwActionType)
-            .map_with(|_, e| CType::Con(Id::qualified("Prelude", "Action", to_position(e.span()))));
+            .map_with(|_, e| {
+                let pos = to_position(e.span());
+                let av = CType::Con(CTyCon::full(
+                    Id::qualified("Prelude", "ActionValue", pos.clone()),
+                    Some(CKind::Fun(Box::new(CKind::Star(Span::DUMMY)), Box::new(CKind::Star(Span::DUMMY)), Span::DUMMY)),
+                    CTyConSort::Struct(StructSubType::Struct, vec![
+                        Id::qualified("Prelude", "__value", pos.clone()),
+                        Id::qualified("Prelude", "__action", pos.clone()),
+                    ]),
+                ));
+                let pu = CType::Con(CTyCon::full(
+                    Id::qualified("Prelude", "PrimUnit", pos.clone()),
+                    Some(CKind::Star(Span::DUMMY)),
+                    CTyConSort::Struct(StructSubType::Struct, vec![]),
+                ));
+                let expansion = CType::Apply(Box::new(av), Box::new(pu), Span::DUMMY);
+                CType::Con(CTyCon::full(
+                    Id::qualified("Prelude", "Action", pos),
+                    Some(CKind::Star(Span::DUMMY)),
+                    CTyConSort::TypeSyn(0, Box::new(expansion)),
+                ))
+            });
 
-        // Parse ActionValue type keyword
         let actionvalue_type = keyword(TokenKind::KwActionValueType)
-            .map_with(|_, e| CType::Con(Id::qualified("Prelude", "ActionValue", to_position(e.span()))));
+            .map_with(|_, e| {
+                let pos = to_position(e.span());
+                CType::Con(CTyCon::full(
+                    Id::qualified("Prelude", "ActionValue", pos.clone()),
+                    Some(CKind::Fun(Box::new(CKind::Star(Span::DUMMY)), Box::new(CKind::Star(Span::DUMMY)), Span::DUMMY)),
+                    CTyConSort::Struct(StructSubType::Struct, vec![
+                        Id::qualified("Prelude", "__value", pos.clone()),
+                        Id::qualified("Prelude", "__action", pos),
+                    ]),
+                ))
+            });
 
-        // Parse void keyword as type
         let void_type = keyword(TokenKind::KwVoid)
-            .map_with(|_, e| CType::Con(Id::qualified("Prelude", "PrimUnit", to_position(e.span()))));
+            .map_with(|_, e| {
+                let pos = to_position(e.span());
+                CType::Con(CTyCon::full(
+                    Id::qualified("Prelude", "PrimUnit", pos),
+                    Some(CKind::Star(Span::DUMMY)),
+                    CTyConSort::Struct(StructSubType::Struct, vec![]),
+                ))
+            });
 
         // Parse Integer keyword as type
         let integer_type = keyword(TokenKind::KwInteger)
-            .map_with(|_, e| CType::Con(Id::qualified("Prelude", "Integer", to_position(e.span()))));
+            .map_with(|_, e| CType::Con(Id::qualified("Prelude", "Integer", to_position(e.span())).into()));
 
         // Parse atomic type expressions
         let atype = choice((paren_or_tuple, bit_type, action_type, actionvalue_type, void_type, integer_type, tyvar, tycon, num_type, str_type)).boxed();
@@ -335,10 +370,14 @@ fn method_prototype<'a>() -> impl Parser<'a, TokenStream<'a>, CField, ParserExtr
                 .or_not()
         )
         .then_ignore(semicolon())
-        .map_with(|((ret_type, name), _args), e| {
+        .map_with(|((ret_type, name), args), e| {
+            let arg_names: Vec<Id> = args.unwrap_or_default()
+                .into_iter()
+                .map(|(name, _ty)| name)
+                .collect();
             CField {
                 name,
-                pragmas: None,
+                pragmas: Some(vec![IfcPragma::ArgNames(arg_names)]),
                 orig_type: None,
                 ty: CQType {
                     context: Vec::new(),
@@ -442,7 +481,7 @@ fn typedef_enum<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CDefn>, ParserExtr
             let internal_summands: Vec<CInternalSummand> = enum_tags.iter().enumerate().map(|(i, tag)| {
                 CInternalSummand {
                     names: vec![tag.clone()],
-                    arg_type: CType::Con(Id::unpositioned("Prelude::PrimUnit")),
+                    arg_type: CType::Con(Id::unpositioned("Prelude::PrimUnit").into()),
                     tag_encoding: i as i64,
                 }
             }).collect();
@@ -596,7 +635,7 @@ fn typedef_union<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CDefn>, ParserExt
                         });
                         internal_summands.push(CInternalSummand {
                             names: vec![con_name],
-                            arg_type: CType::Con(make_id("PrimUnit".into(), Position::unknown())), // Unit type for void
+                            arg_type: CType::Con(make_id("PrimUnit".into(), Position::unknown()).into()), // Unit type for void
                             tag_encoding: tag_encoding as i64,
                         });
                     },
@@ -1117,7 +1156,7 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                 use crate::imperative::build_module_body_expr;
                 let pos = to_position(e.span());
                 let default_ifc = ifc_type.clone().unwrap_or_else(|| {
-                    CType::Con(Id::qualified("Prelude", "Empty", Position::unknown()))
+                    CType::Con(Id::qualified("Prelude", "Empty", Position::unknown()).into())
                 });
                 let m_tyvar = CType::Var(Id::new(SmolStr::new_static("_m__"), Position::unknown()));
                 let c_tyvar = CType::Var(Id::new(SmolStr::new_static("_c__"), Position::unknown()));
@@ -1136,7 +1175,7 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                     ty: result_type,
                     span: Span::DUMMY,
                 };
-                let body_expr = build_module_body_expr(pos.clone(), ifc_type, body);
+                let body_expr = build_module_body_expr(pos.clone(), Some(default_ifc.clone()), body);
                 let def_clause = CClause {
                     patterns: vec![],
                     qualifiers: vec![],
@@ -1929,7 +1968,7 @@ fn create_tagged_union_struct_type(union_name: &Id, constructor_name: &Id) -> CT
         constructor: Box::new(constructor_name.clone()),
     });
 
-    CType::Con(struct_type_id)
+    CType::Con(struct_type_id.into())
 }
 
 /// Create a struct definition for a tagged union constructor with multiple fields.

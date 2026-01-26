@@ -1767,6 +1767,65 @@ pub struct CPred {
     pub span: Span,
 }
 
+/// A type constructor.
+///
+/// Mirrors Haskell's `TyCon` from CType.hs:98-111.
+/// ```haskell
+/// data TyCon = TyCon { tcon_name :: Id, tcon_kind :: Maybe Kind, tcon_sort :: TISort }
+///            | TyNum { tynum_value :: Integer, tynum_pos :: Position }
+///            | TyStr { tystr_value :: FString, tystr_pos :: Position }
+/// ```
+/// Note: TyNum and TyStr are handled by CType::Num and CType::Str respectively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CTyCon {
+    pub name: Id,
+    pub kind: Option<CKind>,
+    pub sort: CTyConSort,
+}
+
+impl CTyCon {
+    pub fn new(name: Id) -> Self {
+        CTyCon { name, kind: None, sort: CTyConSort::Abstract }
+    }
+
+    pub fn with_kind(name: Id, kind: CKind) -> Self {
+        CTyCon { name, kind: Some(kind), sort: CTyConSort::Abstract }
+    }
+
+    pub fn full(name: Id, kind: Option<CKind>, sort: CTyConSort) -> Self {
+        CTyCon { name, kind, sort }
+    }
+
+    pub fn name(&self) -> &Id {
+        &self.name
+    }
+}
+
+impl From<Id> for CTyCon {
+    fn from(id: Id) -> Self {
+        CTyCon::new(id)
+    }
+}
+
+/// Type constructor sort/purpose.
+///
+/// Mirrors Haskell's `TISort` from CType.hs:113-123.
+/// ```haskell
+/// data TISort = TItype Integer Type
+///             | TIdata { tidata_cons :: [Id], tidata_enum :: Bool }
+///             | TIstruct StructSubType [Id]
+///             | TIabstract
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CTyConSort {
+    TypeSyn(i64, Box<CType>),
+    Data { constructors: Vec<Id>, is_enum: bool },
+    Struct(StructSubType, Vec<Id>),
+    Abstract,
+}
+
 /// A type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1776,8 +1835,8 @@ pub enum CType {
     NoType,
     /// Type variable
     Var(Id),
-    /// Type constructor
-    Con(Id),
+    /// Type constructor - mirrors Haskell's `TCon TyCon`
+    Con(CTyCon),
     /// Type application
     Apply(Box<CType>, Box<CType>, Span),
     /// Numeric type literal (mirrors Haskell's TyNum)

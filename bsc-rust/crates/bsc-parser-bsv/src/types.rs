@@ -70,7 +70,7 @@
 use crate::{BsvParser, ParseResult};
 use bsc_diagnostics::{Position, Span};
 use bsc_lexer_bsv::TokenKind;
-use bsc_syntax::{CType, CPred, Id};
+use bsc_syntax::{CType, CPred, CKind, CTyCon, CTyConSort, StructSubType, Id};
 
 impl<'src> BsvParser<'src> {
     /// Parse a type expression.
@@ -189,7 +189,7 @@ impl<'src> BsvParser<'src> {
         };
 
         // Create Bit#(width)
-        let bit_con = CType::Con(Id::new("Bit", pos.clone()));
+        let bit_con = CType::Con(Id::new("Bit", pos.clone()).into());
         let width_type = CType::Num(width as i128, pos.clone());
         let span = Span::new(start_pos, end_pos);
 
@@ -287,7 +287,7 @@ impl<'src> BsvParser<'src> {
         let pos = self.current_position();
         self.advance(); // consume 'void'
 
-        Ok(CType::Con(Id::new("()", pos.clone())))
+        Ok(CType::Con(Id::new("()", pos.clone()).into()))
     }
 
     /// Parse `Action` type.
@@ -344,7 +344,7 @@ impl<'src> BsvParser<'src> {
                     Some(potential_package)
                 } else {
                     // No ::, so this was actually the constructor
-                    return Ok(CType::Con(Id::new(potential_package, pos)));
+                    return Ok(CType::Con(Id::new(potential_package, pos).into()));
                 }
             } else {
                 return Err(self.unexpected_token("type constructor"));
@@ -363,7 +363,7 @@ impl<'src> BsvParser<'src> {
                 };
                 let id = Id::new(qualified_name, pos);
                 self.advance();
-                Ok(CType::Con(id))
+                Ok(CType::Con(id.into()))
             } else {
                 Err(self.unexpected_token("type constructor"))
             }
@@ -668,35 +668,64 @@ fn get_type_span(ty: &CType) -> Span {
 }
 
 
-/// Create an `Int#(32)` type.
-///
-/// Mirrors `tInt32At pos` from Type.hs.
+/// Mirrors `tInt32At pos` from Type.hs:
+/// `tInt32At pos = TAp (tIntAt pos) (t32At pos)`
 fn create_int32_type(pos: Position, span: Span) -> CType {
-    let int_con = CType::Con(Id::new("Int", pos.clone()));
+    let int_con = CType::Con(CTyCon::full(
+        Id::qualified("Prelude", "Int", pos.clone()),
+        Some(CKind::Fun(Box::new(CKind::Num(Span::DUMMY)), Box::new(CKind::Star(Span::DUMMY)), Span::DUMMY)),
+        CTyConSort::Abstract,
+    ));
     let num_32 = CType::Num(32, pos.clone());
     CType::Apply(Box::new(int_con), Box::new(num_32), span)
 }
 
-/// Create a `Real` type.
-///
-/// Mirrors `tRealAt pos` from Type.hs.
+/// Mirrors `tRealAt pos` from Type.hs:
+/// `tRealAt pos = TCon (TyCon (idRealAt pos) (Just KStar) TIabstract)`
 fn create_real_type(pos: Position) -> CType {
-    CType::Con(Id::new("Real", pos))
+    CType::Con(CTyCon::full(
+        Id::qualified("Prelude", "Real", pos),
+        Some(CKind::Star(Span::DUMMY)),
+        CTyConSort::Abstract,
+    ))
 }
 
-/// Create an `Action` type.
-///
-/// Mirrors `tActionAt pos` from Type.hs.
-fn create_action_type(pos: Position) -> CType {
-    CType::Con(Id::new("Action", pos))
+/// Mirrors `tPrimUnitAt pos` from Type.hs:
+/// `tPrimUnitAt pos = TCon (TyCon (idPrimUnitAt pos) (Just KStar) (TIstruct SStruct []))`
+fn create_prim_unit_type(pos: Position) -> CType {
+    CType::Con(CTyCon::full(
+        Id::qualified("Prelude", "PrimUnit", pos),
+        Some(CKind::Star(Span::DUMMY)),
+        CTyConSort::Struct(StructSubType::Struct, vec![]),
+    ))
 }
 
-/// Create an `ActionValue` constructor.
-///
-/// Mirrors `tActionValueAt pos` from Type.hs.
-/// Note: This creates the base constructor; type parameters must be applied separately.
+/// Mirrors `tActionValueAt pos` from Type.hs:
+/// `tActionValueAt pos = TCon (TyCon (idActionValueAt pos) (Just (Kfun KStar KStar)) (TIstruct SStruct [id__value_at pos, id__action_at pos]))`
 fn create_action_value_type(pos: Position) -> CType {
-    CType::Con(Id::new("ActionValue", pos))
+    CType::Con(CTyCon::full(
+        Id::qualified("Prelude", "ActionValue", pos.clone()),
+        Some(CKind::Fun(Box::new(CKind::Star(Span::DUMMY)), Box::new(CKind::Star(Span::DUMMY)), Span::DUMMY)),
+        CTyConSort::Struct(StructSubType::Struct, vec![
+            Id::qualified("Prelude", "__value", pos.clone()),
+            Id::qualified("Prelude", "__action", pos),
+        ]),
+    ))
+}
+
+/// Mirrors `tActionAt pos` from Type.hs:
+/// `tActionAt pos = TCon (TyCon (idActionAt pos) (Just KStar) (TItype 0 (TAp (tActionValueAt pos) (tPrimUnitAt pos))))`
+fn create_action_type(pos: Position) -> CType {
+    let expansion = CType::Apply(
+        Box::new(create_action_value_type(pos.clone())),
+        Box::new(create_prim_unit_type(pos.clone())),
+        Span::DUMMY,
+    );
+    CType::Con(CTyCon::full(
+        Id::qualified("Prelude", "Action", pos),
+        Some(CKind::Star(Span::DUMMY)),
+        CTyConSort::TypeSyn(0, Box::new(expansion)),
+    ))
 }
 
 // ============================================================================
