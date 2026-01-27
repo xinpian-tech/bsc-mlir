@@ -4,7 +4,7 @@
 //! in the top-level package parsing. These mirror the imperative parsing functions
 //! from `src/comp/Parser/BSV/CVParser.lhs`.
 
-use crate::imperative::ImperativeStatement;
+use crate::imperative::{ImperativeStatement, convert_stmts_to_expr};
 use bsc_diagnostics::{Position, Span};
 use bsc_lexer_bsv::TokenKind;
 use bsc_syntax::csyntax::*;
@@ -34,24 +34,60 @@ fn to_position(simple_span: SimpleSpan<u32>) -> Position {
     crate::lookup_position(simple_span.start)
 }
 
+fn p_mk_tuple(pos: Position, pats: Vec<CPat>) -> CPat {
+    match pats.len() {
+        0 => {
+            let unit_id = Id::qualified("Prelude", "PrimUnit", pos);
+            CPat::Struct(Some(true), unit_id, vec![], Span::DUMMY)
+        }
+        1 => pats.into_iter().next().unwrap(),
+        _ => {
+            let mut iter = pats.into_iter().rev();
+            let last = iter.next().unwrap();
+            iter.fold(last, |rest, p| {
+                CPat::Con(Id::new(SmolStr::new_static(","), pos.clone()), vec![p, rest], Span::DUMMY)
+            })
+        }
+    }
+}
+
 fn parse_attribute_name<'a>() -> impl Parser<'a, TokenStream<'a>, SmolStr, ParserExtra<'a>> + Clone {
     select! {
         TokenKind::Id(name) => name,
+        TokenKind::KwClockedBy => SmolStr::from("clocked_by"),
+        TokenKind::KwResetBy => SmolStr::from("reset_by"),
+        TokenKind::KwParameter => SmolStr::from("parameter"),
     }.labelled("attribute name")
 }
 
-fn parse_single_attribute<'a>() -> impl Parser<'a, TokenStream<'a>, SmolStr, ParserExtra<'a>> + Clone {
+fn parse_single_attribute<'a>() -> impl Parser<'a, TokenStream<'a>, (SmolStr, Option<String>), ParserExtra<'a>> + Clone {
     parse_attribute_name()
         .then(
             symbol(TokenKind::SymEq)
-                .ignore_then(any().and_is(symbol(TokenKind::SymStarRParen).not()).and_is(comma().not()).repeated())
+                .ignore_then(
+                    any()
+                        .and_is(symbol(TokenKind::SymStarRParen).not())
+                        .and_is(comma().not())
+                        .repeated()
+                        .collect::<Vec<_>>()
+                )
                 .or_not()
         )
-        .map(|(name, _value)| name)
+        .map(|(name, value_tokens)| {
+            let value = value_tokens.and_then(|tokens: Vec<TokenKind>| {
+                if tokens.len() == 1 {
+                    if let TokenKind::String(s) = &tokens[0] {
+                        return Some(s.clone());
+                    }
+                }
+                None
+            });
+            (name, value)
+        })
         .labelled("single attribute")
 }
 
-fn parse_attributes<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<SmolStr>, ParserExtra<'a>> + Clone {
+fn parse_attributes<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<(SmolStr, Option<String>)>, ParserExtra<'a>> + Clone {
     symbol(TokenKind::SymLParenStar)
         .ignore_then(
             parse_single_attribute()
@@ -287,19 +323,30 @@ fn type_expr<'a>() -> impl Parser<'a, TokenStream<'a>, CType, ParserExtra<'a>> +
         let void_type = keyword(TokenKind::KwVoid)
             .map_with(|_, e| {
                 let pos = to_position(e.span());
-                CType::Con(CTyCon::full(
+                CType::Con(CTyCon::new(
                     Id::qualified("Prelude", "PrimUnit", pos),
-                    Some(CKind::Star(Span::DUMMY)),
-                    CTyConSort::Struct(StructSubType::Struct, vec![]),
                 ))
             });
 
-        // Parse Integer keyword as type
         let integer_type = keyword(TokenKind::KwInteger)
             .map_with(|_, e| CType::Con(Id::qualified("Prelude", "Integer", to_position(e.span())).into()));
 
-        // Parse atomic type expressions
-        let atype = choice((paren_or_tuple, bit_type, action_type, actionvalue_type, void_type, integer_type, tyvar, tycon, num_type, str_type)).boxed();
+        let int_type = keyword(TokenKind::KwInt)
+            .map_with(|_, e| {
+                let pos = to_position(e.span());
+                let int_con = CType::Con(CTyCon::full(
+                    Id::qualified("Prelude", "Int", pos.clone()),
+                    Some(CKind::Fun(Box::new(CKind::Num(Span::DUMMY)), Box::new(CKind::Star(Span::DUMMY)), Span::DUMMY)),
+                    CTyConSort::Abstract,
+                ));
+                CType::Apply(
+                    Box::new(int_con),
+                    Box::new(CType::Num(32, pos)),
+                    Span::DUMMY,
+                )
+            });
+
+        let atype = choice((paren_or_tuple, bit_type, action_type, actionvalue_type, void_type, integer_type, int_type, tyvar, tycon, num_type, str_type)).boxed();
 
         // Parse type application with # syntax: Type#(arg1, arg2, ...)
         let type_with_params = atype
@@ -358,10 +405,14 @@ fn proviso<'a>() -> impl Parser<'a, TokenStream<'a>, CPred, ParserExtra<'a>> + C
 }
 
 fn function_arg<'a>() -> impl Parser<'a, TokenStream<'a>, (Id, Option<CType>), ParserExtra<'a>> + Clone {
-    type_expr()
-        .then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
-        .map(|(ty, name)| (name, Some(ty)))
-        .labelled("function argument")
+    choice((
+        type_expr()
+            .then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
+            .map(|(ty, name)| (name, Some(ty))),
+        word().map_with(|name, e| make_id(name, to_position(e.span())))
+            .map(|name| (name, None)),
+    ))
+    .labelled("function argument")
 }
 
 fn method_prototype<'a>() -> impl Parser<'a, TokenStream<'a>, CField, ParserExtra<'a>> + Clone {
@@ -382,17 +433,23 @@ fn method_prototype<'a>() -> impl Parser<'a, TokenStream<'a>, CField, ParserExtr
         )
         .then_ignore(semicolon())
         .map_with(|((ret_type, name), args), e| {
-            let arg_names: Vec<Id> = args.unwrap_or_default()
-                .into_iter()
-                .map(|(name, _ty)| name)
+            let params = args.unwrap_or_default();
+            let arg_names: Vec<Id> = params.iter()
+                .map(|(name, _ty)| name.clone())
                 .collect();
+            let arg_types: Vec<CType> = params.into_iter()
+                .filter_map(|(_name, ty)| ty)
+                .collect();
+            let method_type = arg_types.into_iter().rev().fold(ret_type, |acc, arg_ty| {
+                crate::make_fn_type(arg_ty, acc)
+            });
             CField {
                 name,
                 pragmas: Some(vec![IfcPragma::ArgNames(arg_names)]),
                 orig_type: None,
                 ty: CQType {
                     context: Vec::new(),
-                    ty: ret_type,
+                    ty: method_type,
                     span: to_span(e.span()),
                 },
                 default: Vec::new(),
@@ -424,12 +481,61 @@ fn subinterface_prototype<'a>() -> impl Parser<'a, TokenStream<'a>, CField, Pars
         .labelled("subinterface prototype")
 }
 
+fn attributes_to_ifc_pragmas(attrs: &[(SmolStr, Option<String>)], is_method: bool) -> Vec<IfcPragma> {
+    let mut pragmas = Vec::new();
+    for (name, value) in attrs.iter().rev() {
+        match (name.as_str(), is_method) {
+            ("prefix", _) => {
+                if let Some(s) = value {
+                    pragmas.push(IfcPragma::Prefix(s.clone()));
+                }
+            }
+            ("ready", true) => {
+                if let Some(s) = value {
+                    pragmas.push(IfcPragma::Ready(s.clone()));
+                }
+            }
+            ("enable", true) => {
+                if let Some(s) = value {
+                    pragmas.push(IfcPragma::Enable(s.clone()));
+                }
+            }
+            ("result", true) => {
+                if let Some(s) = value {
+                    pragmas.push(IfcPragma::Result(s.clone()));
+                }
+            }
+            ("always_ready", _) => {
+                pragmas.push(IfcPragma::AlwaysReady);
+            }
+            ("always_enabled", _) => {
+                pragmas.push(IfcPragma::AlwaysEnabled);
+            }
+            _ => {}
+        }
+    }
+    pragmas
+}
+
 fn interface_member<'a>() -> impl Parser<'a, TokenStream<'a>, CField, ParserExtra<'a>> + Clone {
-    skip_attributes()
-        .ignore_then(choice((
+    parse_attributes()
+        .then(choice((
             method_prototype(),
             subinterface_prototype(),
         )))
+        .map(|(attrs, mut field)| {
+            let is_method = field.pragmas.is_some();
+            let attr_pragmas = attributes_to_ifc_pragmas(&attrs, is_method);
+            match &mut field.pragmas {
+                Some(prags) => {
+                    prags.extend(attr_pragmas);
+                }
+                None => {
+                    field.pragmas = Some(attr_pragmas);
+                }
+            }
+            field
+        })
         .labelled("interface member")
 }
 
@@ -495,7 +601,7 @@ fn typedef_enum<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CDefn>, ParserExtr
             let internal_summands: Vec<CInternalSummand> = enum_tags.iter().enumerate().map(|(i, tag)| {
                 CInternalSummand {
                     names: vec![tag.clone()],
-                    arg_type: CType::Con(Id::unpositioned("Prelude::PrimUnit").into()),
+                    arg_type: CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()).into()),
                     tag_encoding: i as i64,
                 }
             }).collect();
@@ -704,7 +810,7 @@ fn typedef_union<'a>() -> impl Parser<'a, TokenStream<'a>, Vec<CDefn>, ParserExt
                         });
                         internal_summands.push(CInternalSummand {
                             names: vec![con_name],
-                            arg_type: CType::Con(make_id("PrimUnit".into(), Position::unknown()).into()), // Unit type for void
+                            arg_type: CType::Con(Id::qualified("Prelude", "PrimUnit", Position::unknown()).into()),
                             tag_encoding: tag_encoding as i64,
                         });
                     },
@@ -810,9 +916,29 @@ fn expr<'a>() -> impl Parser<'a, TokenStream<'a>, CExpr, ParserExtra<'a>> + Clon
             Err(Rich::custom(span, "expected lowercase identifier"))
         });
 
-        // pConstructorPrimary: Parse uppercase constructors -> CCon name []
+        // pConstructorPrimary: Parse uppercase constructors
+        // Mirrors Haskell CVParser.lhs:1717-1731
+        // Tries: Name { field: val, ... } -> CStruct, or Name -> CCon
+        let field_init = word()
+            .map_with(|name, e| make_id(name, to_position(e.span())))
+            .then_ignore(symbol(TokenKind::SymColon))
+            .then(expr.clone())
+            .map(|(name, value)| CFieldInit { name, value, span: Span::DUMMY });
         let constructor_expr = constructor()
-            .map(|con| CExpr::Con(con, vec![], Span::DUMMY));
+            .then(
+                field_init
+                    .separated_by(comma())
+                    .collect::<Vec<CFieldInit>>()
+                    .delimited_by(symbol(TokenKind::SymLBrace), symbol(TokenKind::SymRBrace))
+                    .or_not()
+            )
+            .map(|(con, opt_fields)| {
+                if let Some(fields) = opt_fields {
+                    CExpr::Struct(Some(true), con, fields, Span::DUMMY)
+                } else {
+                    CExpr::Con(con, vec![], Span::DUMMY)
+                }
+            });
 
         // pTaskIdentifier: Parse system identifiers like $finish -> CTaskApply
         // Mirrors Haskell's cVar: task names become CTaskApply (CVar name) []
@@ -901,8 +1027,37 @@ fn expr<'a>() -> impl Parser<'a, TokenStream<'a>, CExpr, ParserExtra<'a>> + Clon
                 CExpr::Con(con, args, to_span(e.span()))
             });
 
+        // pBitConcatPrimary: bit concatenation {a, b, c}
+        // Mirrors Haskell CVParser.lhs:1846-1853
+        // foldr1 cat where cat (e,p) (es,_) = (cApply 19 (catAt p) [e, es], p)
+        // catAt pos = cVar (idPrimConcatAt pos) = CVar (Prelude.primConcat)
+        let bit_concat = symbol(TokenKind::SymLBrace)
+            .ignore_then(
+                expr.clone()
+                    .separated_by(comma())
+                    .at_least(1)
+                    .collect::<Vec<CExpr>>()
+            )
+            .then_ignore(symbol(TokenKind::SymRBrace))
+            .map(|exprs: Vec<CExpr>| {
+                if exprs.len() == 1 {
+                    return exprs.into_iter().next().unwrap();
+                }
+                let mut iter = exprs.into_iter().rev();
+                let first = iter.next().unwrap();
+                iter.fold(first, |acc, e| {
+                    let concat_id = Id::qualified("Prelude", "primConcat", Position::unknown());
+                    CExpr::Apply(
+                        Box::new(CExpr::Var(concat_id)),
+                        vec![e, acc],
+                        Span::DUMMY,
+                    )
+                })
+            })
+            .labelled("expression");
+
         // pPrimary: primary expressions (atoms)
-        let primary = choice((paren, system_task, question, tagged_expr, var, int_lit, str_lit, constructor_expr)).boxed();
+        let primary = choice((paren, system_task, question, tagged_expr, bit_concat, var, int_lit, str_lit, constructor_expr)).boxed();
 
         // Unary prefix operators: !, ~, -
         let unary_expr = choice((
@@ -947,10 +1102,16 @@ fn expr<'a>() -> impl Parser<'a, TokenStream<'a>, CExpr, ParserExtra<'a>> + Clon
             BitSel(Position, CExpr),      // [index] -> CSub
             BitSelRange(CExpr, CExpr),    // [hi:lo] -> CSub2/IndexRange
             Params(Vec<CExpr>),           // #(exprs) -> CApply (BSV pParameters)
+            QualAccess(SmolStr, Position), // ::name -> qualified identifier (Pkg::func or Pkg::Con)
         }
 
-        // Parse all suffixes: .field, (args), [index], #(types)
+        // Parse all suffixes: .field, ::name, (args), [index], #(types)
         let suffix = choice((
+            // ::name (pQualIdentifier: PackageName::identifier)
+            // Mirrors Haskell's pQualIdentifier/pQualConstructor from CVParser.lhs:402-447
+            symbol(TokenKind::SymColonColon)
+                .ignore_then(word().map_with(|name, e| (name, to_position(e.span()))))
+                .map(|(name, pos)| Suffix::QualAccess(name, pos)),
             // .field (pPrimaryWithFields: pSymbol SV_SYM_dot >> pQualIdentifier)
             symbol(TokenKind::SymDot)
                 .ignore_then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
@@ -1029,83 +1190,116 @@ fn expr<'a>() -> impl Parser<'a, TokenStream<'a>, CExpr, ParserExtra<'a>> + Clon
                 Suffix::BitSel(pos, index) => CExpr::Index { pos, expr: Box::new(e), index: Box::new(index), span: Span::DUMMY },
                 Suffix::BitSelRange(hi, lo) => CExpr::IndexRange { expr: Box::new(e), hi: Box::new(hi), lo: Box::new(lo), span: Span::DUMMY },
                 Suffix::Params(params) => if params.is_empty() { e } else { CExpr::Apply(Box::new(e), params, Span::DUMMY) },
+                Suffix::QualAccess(name, pos) => {
+                    let pkg_name = match &e {
+                        CExpr::Var(id) => id.name().to_string(),
+                        CExpr::Con(id, _, _) => id.name().to_string(),
+                        _ => return e,
+                    };
+                    let pkg_pos = match &e {
+                        CExpr::Var(id) => id.position().clone(),
+                        CExpr::Con(id, _, _) => id.position().clone(),
+                        _ => pos.clone(),
+                    };
+                    if name.chars().next().unwrap_or('a').is_uppercase() {
+                        CExpr::Con(Id::qualified(pkg_name, name, pkg_pos), vec![], Span::DUMMY)
+                    } else {
+                        CExpr::Var(Id::qualified(pkg_name, name, pkg_pos))
+                    }
+                },
             },
         );
 
-        // Binary operators for comparison and arithmetic expressions
-        // This is a simplified pratt-style parser for common operators
-        #[derive(Clone)]
-        enum BinOp {
-            LtEq,      // <=
-            GtEq,      // >=
-            Lt,        // <
-            Gt,        // >
-            Eq,        // ==
-            NotEq,     // !=
-            Plus,      // +
-            Minus,     // -
-            Star,      // *
-            Slash,     // /
-            And,       // &&
-            Or,        // ||
-            BitAnd,    // &
-            BitOr,     // |
-            BitXor,    // ^
-            LShift,    // <<
-            RShift,    // >>
+        fn make_bin(left: CExpr, op_id: Id, right: CExpr) -> CExpr {
+            crate::operators::make_binary_expr(left, op_id, right)
         }
 
-        let binop = choice((
-            symbol(TokenKind::SymLtEq).to(BinOp::LtEq),
-            symbol(TokenKind::SymGtEq).to(BinOp::GtEq),
-            symbol(TokenKind::SymLt).to(BinOp::Lt),
-            symbol(TokenKind::SymGt).to(BinOp::Gt),
-            symbol(TokenKind::SymEqEq).to(BinOp::Eq),
-            symbol(TokenKind::SymBangEq).to(BinOp::NotEq),
-            symbol(TokenKind::SymPlus).to(BinOp::Plus),
-            symbol(TokenKind::SymMinus).to(BinOp::Minus),
-            symbol(TokenKind::SymStar).to(BinOp::Star),
-            symbol(TokenKind::SymSlash).to(BinOp::Slash),
-            symbol(TokenKind::SymAndAnd).to(BinOp::And),
-            symbol(TokenKind::SymPipePipe).to(BinOp::Or),
-            symbol(TokenKind::SymAnd).to(BinOp::BitAnd),
-            symbol(TokenKind::SymPipe).to(BinOp::BitOr),
-            symbol(TokenKind::SymCaret).to(BinOp::BitXor),
-            symbol(TokenKind::SymLtLt).to(BinOp::LShift),
-            symbol(TokenKind::SymGtGt).to(BinOp::RShift),
+        let op_star_star = symbol(TokenKind::SymStarStar).map_with(|_, e| crate::operators::id_star_star_at(to_position(e.span())));
+        let level_power = primary_with_suffix.clone().foldl(
+            op_star_star.then(primary_with_suffix.clone()).repeated(),
+            |l, (op, r)| make_bin(l, op, r),
+        ).boxed();
+
+        let op_mul = choice((
+            symbol(TokenKind::SymStar).map_with(|_, e| crate::operators::id_star_at(to_position(e.span()))),
+            symbol(TokenKind::SymSlash).map_with(|_, e| crate::operators::id_slash_at(to_position(e.span()))),
+            symbol(TokenKind::SymPercent).map_with(|_, e| crate::operators::id_percent_at(to_position(e.span()))),
         ));
+        let level_mul = level_power.clone().foldl(
+            op_mul.then(level_power).repeated(),
+            |l, (op, r)| make_bin(l, op, r),
+        ).boxed();
 
-        fn op_to_id(op: &BinOp, pos: Position) -> Id {
-            use crate::operators::*;
-            match op {
-                BinOp::LtEq => id_lt_eq_at(pos),
-                BinOp::GtEq => id_gt_eq_at(pos),
-                BinOp::Lt => id_lt_at(pos),
-                BinOp::Gt => id_gt_at(pos),
-                BinOp::Eq => id_equal_at(pos),
-                BinOp::NotEq => id_not_equal_at(pos),
-                BinOp::Plus => id_plus_at(pos),
-                BinOp::Minus => id_minus_at(pos),
-                BinOp::Star => id_star_at(pos),
-                BinOp::Slash => id_slash_at(pos),
-                BinOp::And => id_and_at(pos),
-                BinOp::Or => id_or_at(pos),
-                BinOp::BitAnd => id_bit_and_at(pos),
-                BinOp::BitOr => id_bit_or_at(pos),
-                BinOp::BitXor => id_caret_at(pos),
-                BinOp::LShift => id_lsh_at(pos),
-                BinOp::RShift => id_rsh_at(pos),
-            }
-        }
+        let op_add = choice((
+            symbol(TokenKind::SymPlus).map_with(|_, e| crate::operators::id_plus_at(to_position(e.span()))),
+            symbol(TokenKind::SymMinus).map_with(|_, e| crate::operators::id_minus_at(to_position(e.span()))),
+        ));
+        let level_add = level_mul.clone().foldl(
+            op_add.then(level_mul).repeated(),
+            |l, (op, r)| make_bin(l, op, r),
+        ).boxed();
 
-        // Parse binary expressions: primary (op primary)*
-        // This creates left-associative expressions
-        let binary_expr = primary_with_suffix.clone().foldl(
-            binop.then(primary_with_suffix).repeated(),
-            |left, (op, right)| {
-                let op_id = op_to_id(&op, Position::unknown());
-                crate::operators::make_binary_expr(left, op_id, right)
-            },
+        let op_shift = choice((
+            symbol(TokenKind::SymLtLt).map_with(|_, e| crate::operators::id_lsh_at(to_position(e.span()))),
+            symbol(TokenKind::SymGtGt).map_with(|_, e| crate::operators::id_rsh_at(to_position(e.span()))),
+        ));
+        let level_shift = level_add.clone().foldl(
+            op_shift.then(level_add).repeated(),
+            |l, (op, r)| make_bin(l, op, r),
+        ).boxed();
+
+        let op_rel = choice((
+            symbol(TokenKind::SymLtEq).map_with(|_, e| crate::operators::id_lt_eq_at(to_position(e.span()))),
+            symbol(TokenKind::SymGtEq).map_with(|_, e| crate::operators::id_gt_eq_at(to_position(e.span()))),
+            symbol(TokenKind::SymLt).map_with(|_, e| crate::operators::id_lt_at(to_position(e.span()))),
+            symbol(TokenKind::SymGt).map_with(|_, e| crate::operators::id_gt_at(to_position(e.span()))),
+        ));
+        let level_rel = level_shift.clone().foldl(
+            op_rel.then(level_shift).repeated(),
+            |l, (op, r)| make_bin(l, op, r),
+        ).boxed();
+
+        let op_eq = choice((
+            symbol(TokenKind::SymEqEq).map_with(|_, e| crate::operators::id_equal_at(to_position(e.span()))),
+            symbol(TokenKind::SymBangEq).map_with(|_, e| crate::operators::id_not_equal_at(to_position(e.span()))),
+        ));
+        let level_eq = level_rel.clone().foldl(
+            op_eq.then(level_rel).repeated(),
+            |l, (op, r)| make_bin(l, op, r),
+        ).boxed();
+
+        let op_band = symbol(TokenKind::SymAnd).map_with(|_, e| crate::operators::id_bit_and_at(to_position(e.span())));
+        let level_band = level_eq.clone().foldl(
+            op_band.then(level_eq).repeated(),
+            |l, (op, r)| make_bin(l, op, r),
+        ).boxed();
+
+        let op_bxor = choice((
+            symbol(TokenKind::SymCaret).map_with(|_, e| crate::operators::id_caret_at(to_position(e.span()))),
+            symbol(TokenKind::SymTildeCaret).map_with(|_, e| crate::operators::id_tilde_caret_at(to_position(e.span()))),
+            symbol(TokenKind::SymCaretTilde).map_with(|_, e| crate::operators::id_caret_tilde_at(to_position(e.span()))),
+        ));
+        let level_bxor = level_band.clone().foldl(
+            op_bxor.then(level_band).repeated(),
+            |l, (op, r)| make_bin(l, op, r),
+        ).boxed();
+
+        let op_bor = symbol(TokenKind::SymPipe).map_with(|_, e| crate::operators::id_bit_or_at(to_position(e.span())));
+        let level_bor = level_bxor.clone().foldl(
+            op_bor.then(level_bxor).repeated(),
+            |l, (op, r)| make_bin(l, op, r),
+        ).boxed();
+
+        let op_land = symbol(TokenKind::SymAndAnd).map_with(|_, e| crate::operators::id_and_at(to_position(e.span())));
+        let level_land = level_bor.clone().foldl(
+            op_land.then(level_bor).repeated(),
+            |l, (op, r)| make_bin(l, op, r),
+        ).boxed();
+
+        let op_lor = symbol(TokenKind::SymPipePipe).map_with(|_, e| crate::operators::id_or_at(to_position(e.span())));
+        let binary_expr = level_land.clone().foldl(
+            op_lor.then(level_land).repeated(),
+            |l, (op, r)| make_bin(l, op, r),
         ).boxed();
 
         // Ternary conditional: cond ? then_expr : else_expr
@@ -1229,7 +1423,7 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                     .collect::<Vec<_>>()
             )
             .then_ignore(symbol(TokenKind::SymRParen))
-            .map(|mut ports: Vec<(Id, CType, Vec<SmolStr>)>| {
+            .map(|mut ports: Vec<(Id, CType, Vec<(SmolStr, Option<String>)>)>| {
                 let last = ports.pop().unwrap();
                 let ifc_type = last.1;
                 let args: Vec<(Id, CType)> = ports.into_iter().map(|(n, t, _)| (n, t)).collect();
@@ -1237,7 +1431,13 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
             });
 
         let module_def = keyword(TokenKind::KwModule)
-            .ignore_then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
+            .ignore_then(
+                symbol(TokenKind::SymLBracket)
+                    .ignore_then(type_expr())
+                    .then_ignore(symbol(TokenKind::SymRBracket))
+                    .or_not()
+            )
+            .then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
             .then(
                 symbol(TokenKind::SymHash)
                     .ignore_then(
@@ -1277,7 +1477,7 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                             .or_not()
                     )
             )
-            .map_with(|((((name, static_params), (port_args, ifc_type)), provisos), body), e| {
+            .map_with(|(((((monad_ctx, name), static_params), (port_args, ifc_type)), provisos), body), e| {
                 use crate::imperative::build_module_body_expr;
                 let pos = to_position(e.span());
                 let default_ifc = ifc_type.clone().unwrap_or_else(|| {
@@ -1285,10 +1485,21 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                 });
                 let mut all_params: Vec<(Id, CType)> = static_params;
                 all_params.extend(port_args);
-                let m_tyvar = CType::Var(Id::new(SmolStr::new_static("_m__"), Position::unknown()));
-                let c_tyvar = CType::Var(Id::new(SmolStr::new_static("_c__"), Position::unknown()));
+                let (monad_type, context_preds) = match monad_ctx {
+                    Some(t) => (t, vec![]),
+                    None => {
+                        let m_tyvar = CType::Var(Id::new(SmolStr::new_static("_m__"), Position::unknown()));
+                        let c_tyvar = CType::Var(Id::new(SmolStr::new_static("_c__"), Position::unknown()));
+                        let is_module_pred = CPred {
+                            class: Id::qualified("Prelude", "IsModule", Position::unknown()),
+                            args: vec![m_tyvar.clone(), c_tyvar],
+                            span: Span::DUMMY,
+                        };
+                        (m_tyvar, vec![is_module_pred])
+                    }
+                };
                 let result_type = CType::Apply(
-                    Box::new(m_tyvar.clone()),
+                    Box::new(monad_type),
                     Box::new(default_ifc.clone()),
                     Span::DUMMY,
                 );
@@ -1300,12 +1511,7 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                         crate::make_fn_type(param_ty, acc)
                     })
                 };
-                let is_module_pred = CPred {
-                    class: Id::qualified("Prelude", "IsModule", Position::unknown()),
-                    args: vec![m_tyvar, c_tyvar],
-                    span: Span::DUMMY,
-                };
-                let mut all_context = vec![is_module_pred];
+                let mut all_context = context_preds;
                 all_context.extend(provisos);
                 let module_type = CQType {
                     context: all_context,
@@ -1389,7 +1595,8 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
             .labelled("function definition");
 
         let interface_decl = keyword(TokenKind::KwInterface)
-            .ignore_then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
+            .ignore_then(constructor())
+            .then(typedef_params())
             .then_ignore(semicolon())
             .then(interface_member().repeated().collect::<Vec<_>>())
             .then_ignore(
@@ -1400,11 +1607,13 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                             .or_not()
                     )
             )
-            .map_with(|(name, members), e| {
+            .map_with(|((name, type_params), members), e| {
+                let (params, kinds): (Vec<Id>, Vec<CPartialKind>) = type_params.into_iter().unzip();
+                let idk = mk_idk(name, &kinds);
                 ImperativeStatement::InterfaceDecl {
                     pos: to_position(e.span()),
-                    name,
-                    type_vars: Vec::new(),
+                    name: idk,
+                    type_vars: params,
                     members,
                 }
             })
@@ -1449,9 +1658,75 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                     guard,
                     body_pos,
                     body,
+                    schedule_pragmas: Vec::new(),
+                    rule_pragmas: Vec::new(),
                 }
             })
             .labelled("rule definition");
+
+        let rules_expr = keyword(TokenKind::KwRules)
+            .ignore_then(
+                symbol(TokenKind::SymColon)
+                    .ignore_then(word())
+                    .or_not()
+            )
+            .ignore_then(stmt.clone().repeated().collect::<Vec<ImperativeStatement>>())
+            .then_ignore(
+                keyword(TokenKind::KwEndrules)
+                    .then_ignore(
+                        symbol(TokenKind::SymColon)
+                            .ignore_then(word())
+                            .or_not()
+                    )
+            )
+            .map_with(|stmts, e| {
+                crate::imperative::convert_rules_block_to_expr(stmts, to_position(e.span()))
+            })
+            .labelled("rules expression");
+
+        let expr_or_rules = choice((rules_expr.clone(), expr()));
+
+        let typed_var_decl_with_rules = type_expr()
+            .then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
+            .then(
+                symbol(TokenKind::SymEq)
+                    .ignore_then(expr_or_rules.clone())
+                    .or_not()
+            )
+            .then_ignore(semicolon())
+            .map(|((ty, name), opt_init)| {
+                let init = opt_init.unwrap_or_else(|| {
+                    let pos = name.position().clone();
+                    let uninit_id = Id::qualified("Prelude", "primUninitialized", pos.clone());
+                    let pos_lit = CExpr::Lit(Literal::Position, pos.clone());
+                    let name_lit = CExpr::Lit(Literal::String(name.name().to_string()), pos);
+                    CExpr::Apply(
+                        Box::new(CExpr::Var(uninit_id)),
+                        vec![pos_lit, name_lit],
+                        Span::DUMMY,
+                    )
+                });
+                ImperativeStatement::Decl {
+                    ty: Some(ty),
+                    name,
+                    init: Some(init),
+                }
+            })
+            .labelled("typed variable declaration");
+
+        let module_inst_arrow_with_rules = type_expr()
+            .then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
+            .then_ignore(symbol(TokenKind::SymLArrow))
+            .then(expr_or_rules)
+            .then_ignore(semicolon())
+            .map(|((ifc_type, ifc_var), constructor)| {
+                ImperativeStatement::Bind {
+                    name: ifc_var,
+                    ty: Some(ifc_type),
+                    expr: constructor,
+                }
+            })
+            .labelled("typed bind with arrow");
 
         let method_def = keyword(TokenKind::KwMethod)
             .ignore_then(type_expr().or_not())
@@ -1518,7 +1793,14 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                 init: Some(init_expr),
             });
 
-        let let_stmt = choice((let_tuple, let_simple))
+        let let_bind = keyword(TokenKind::KwLet)
+            .ignore_then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
+            .then_ignore(symbol(TokenKind::SymLArrow))
+            .then(expr())
+            .then_ignore(semicolon())
+            .map(|(name, expr)| ImperativeStatement::LetBind { name, expr });
+
+        let let_stmt = choice((let_tuple, let_bind, let_simple))
             .labelled("let statement");
 
         let return_stmt = keyword(TokenKind::KwReturn)
@@ -1527,10 +1809,133 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
             .map_with(|expr, e| ImperativeStatement::Return { pos: to_position(e.span()), expr })
             .labelled("return statement");
 
+        let pattern = recursive(|pat: Recursive<dyn Parser<'a, TokenStream<'a>, CPat, ParserExtra<'a>> + 'a>| {
+            let pattern_variable = symbol(TokenKind::SymDot)
+                .ignore_then(word().map_with(|name, e| CPat::Var(make_id(name, to_position(e.span())))))
+                .labelled("pattern variable");
+
+            let wildcard_pat = symbol(TokenKind::SymDotStar)
+                .map_with(|_, e| CPat::Wildcard(to_position(e.span())))
+                .labelled("wildcard pattern");
+
+            let tuple_pat = pat.clone()
+                .separated_by(comma())
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .delimited_by(symbol(TokenKind::SymLBrace), symbol(TokenKind::SymRBrace))
+                .map_with(|pats, e| {
+                    let pos = to_position(e.span());
+                    p_mk_tuple(pos, pats)
+                })
+                .labelled("tuple pattern");
+
+            let tagged_pat = keyword(TokenKind::KwTagged)
+                .ignore_then(constructor())
+                .then(
+                    choice((
+                        pat.clone()
+                            .separated_by(comma())
+                            .at_least(1)
+                            .collect::<Vec<_>>()
+                            .delimited_by(symbol(TokenKind::SymLBrace), symbol(TokenKind::SymRBrace))
+                            .map_with(|pats, e| {
+                                let pos = to_position(e.span());
+                                vec![p_mk_tuple(pos, pats)]
+                            }),
+                        symbol(TokenKind::SymDot)
+                            .ignore_then(word().map_with(|name, e| CPat::Var(make_id(name, to_position(e.span())))))
+                            .map(|p| vec![p]),
+                        pat.clone()
+                            .delimited_by(symbol(TokenKind::SymLParen), symbol(TokenKind::SymRParen))
+                            .map(|p| vec![p]),
+                        symbol(TokenKind::SymDotStar)
+                            .map_with(|_, e| CPat::Wildcard(to_position(e.span())))
+                            .map(|p| vec![p]),
+                    ))
+                    .or_not()
+                    .map(|opt| opt.unwrap_or_default())
+                )
+                .map(|(con, args)| CPat::Con(con, args, Span::DUMMY))
+                .labelled("tagged pattern");
+
+            let enum_or_struct_pat = constructor()
+                .map(|name| CPat::Con(name, Vec::new(), Span::DUMMY))
+                .labelled("enum pattern");
+
+            let paren_pat = pat.clone()
+                .delimited_by(symbol(TokenKind::SymLParen), symbol(TokenKind::SymRParen))
+                .labelled("parenthesized pattern");
+
+            let const_pat = any().try_map(|token: TokenKind, span| {
+                match token {
+                    TokenKind::Integer { value, size, base } => {
+                        let lit = Literal::Integer(IntLiteral {
+                            value: value.to_string().parse().unwrap_or(0),
+                            width: size.as_ref().and_then(|s| s.to_string().parse().ok()),
+                            base: match base {
+                                2 => IntBase::Binary,
+                                8 => IntBase::Octal,
+                                16 => IntBase::Hexadecimal,
+                                _ => IntBase::Decimal,
+                            },
+                        });
+                        Ok(CPat::Lit(lit, to_position(span)))
+                    }
+                    TokenKind::Number { value, bitwidth, base, .. } => {
+                        use bsc_lexer_bsv::SvNumber;
+                        let int_value: i128 = match value {
+                            SvNumber::Integer(v) => v.to_string().parse().unwrap_or(0),
+                            SvNumber::Real(f) => f as i128,
+                            _ => 0,
+                        };
+                        let lit = Literal::Integer(IntLiteral {
+                            value: int_value,
+                            width: bitwidth.as_ref().and_then(|s| s.to_string().parse().ok()),
+                            base: match base {
+                                Some(bsc_lexer_bsv::SvNumericBase::Bin) => IntBase::Binary,
+                                Some(bsc_lexer_bsv::SvNumericBase::Oct) => IntBase::Octal,
+                                Some(bsc_lexer_bsv::SvNumericBase::Hex) => IntBase::Hexadecimal,
+                                _ => IntBase::Decimal,
+                            },
+                        });
+                        Ok(CPat::Lit(lit, to_position(span)))
+                    }
+                    TokenKind::String(s) => {
+                        let lit = Literal::String(s.to_string());
+                        Ok(CPat::Lit(lit, to_position(span)))
+                    }
+                    _ => Err(Rich::custom(span, "expected constant pattern")),
+                }
+            })
+            .labelled("constant pattern");
+
+            choice((pattern_variable, tagged_pat, paren_pat, tuple_pat, wildcard_pat, enum_or_struct_pat, const_pat))
+                .labelled("pattern")
+        });
+
+        let cond_expression = expr()
+            .then(
+                keyword(TokenKind::KwMatches)
+                    .ignore_then(pattern.clone())
+                    .or_not()
+            )
+            .map(|(e, pat_opt)| {
+                match pat_opt {
+                    Some(pat) => CQual::Gen(CType::NoType, pat, e),
+                    None => CQual::Filter(e),
+                }
+            });
+
+        let cond_expressions = cond_expression
+            .separated_by(symbol(TokenKind::SymAndAndAnd))
+            .at_least(1)
+            .collect::<Vec<CQual>>()
+            .labelled("condition expressions");
+
         let if_stmt = keyword(TokenKind::KwIf)
             .ignore_then(
                 symbol(TokenKind::SymLParen)
-                    .ignore_then(expr())
+                    .ignore_then(cond_expressions)
                     .then_ignore(symbol(TokenKind::SymRParen))
             )
             .then(stmt.clone())
@@ -1627,7 +2032,9 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
         )).foldl(
             choice((
                 symbol(TokenKind::SymDot)
-                    .ignore_then(word().map_with(|name, e| make_id(name, to_position(e.span()))))
+                    .map_with(|_, e| to_position(e.span()))
+                    .then(word())
+                    .map(|(dot_pos, name)| make_id(name, dot_pos))
                     .map(RegSuffix::Field),
                 symbol(TokenKind::SymLParen)
                     .ignore_then(
@@ -1660,112 +2067,14 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
         );
 
         let reg_write = reg_write_lhs
-            .then_ignore(symbol(TokenKind::SymLtEq))
+            .then(symbol(TokenKind::SymLtEq).map_with(|_, e| e.span()))
             .then(expr())
             .then_ignore(semicolon())
-            .map(|(lhs, rhs)| ImperativeStatement::RegWrite { lhs, rhs })
-            .labelled("register write");
-
-        // Pattern parser for case matches
-        // Mirrors pPattern from CVParser.lhs
-        // Mirrors pPattern from CVParser.lhs:2669-2677
-        // pPattern = pPatternVariable <|> tagged_constr <|> constr <|> paren <|> tuple <|> wildcard <|> const
-        let pattern = recursive(|pat: Recursive<dyn Parser<'a, TokenStream<'a>, CPat, ParserExtra<'a>> + 'a>| {
-            // pPatternVariable: .name => CPVar name (Haskell CVParser.lhs:2712-2716)
-            let pattern_variable = symbol(TokenKind::SymDot)
-                .ignore_then(word().map_with(|name, e| CPat::Var(make_id(name, to_position(e.span())))))
-                .labelled("pattern variable");
-
-            // pWildcardPattern: .* => CPAny pos (Haskell CVParser.lhs:2788-2792)
-            let wildcard_pat = symbol(TokenKind::SymDotStar)
-                .map_with(|_, e| CPat::Wildcard(to_position(e.span())))
-                .labelled("wildcard pattern");
-
-            // pConstrPatternWith: after 'tagged Constructor', parse the body
-            // Haskell CVParser.lhs:2679-2692
-            let tagged_pat = keyword(TokenKind::KwTagged)
-                .ignore_then(constructor())
-                .then(
-                    choice((
-                        // .var => CPCon constr [CPVar var]
-                        symbol(TokenKind::SymDot)
-                            .ignore_then(word().map_with(|name, e| CPat::Var(make_id(name, to_position(e.span())))))
-                            .map(|p| vec![p]),
-                        // (pattern) => CPCon constr [pat]
-                        pat.clone()
-                            .delimited_by(symbol(TokenKind::SymLParen), symbol(TokenKind::SymRParen))
-                            .map(|p| vec![p]),
-                        // wildcard/const/enum pattern => CPCon constr [pat]
-                        symbol(TokenKind::SymDotStar)
-                            .map_with(|_, e| CPat::Wildcard(to_position(e.span())))
-                            .map(|p| vec![p]),
-                    ))
-                    .or_not()
-                    .map(|opt| opt.unwrap_or_default())
-                )
-                .map(|(con, args)| CPat::Con(con, args, Span::DUMMY))
-                .labelled("tagged pattern");
-
-            // pStructOrEnumPatternWith: Constructor {fields} or just Constructor
-            // Haskell CVParser.lhs:2694-2699
-            let enum_or_struct_pat = constructor()
-                .map(|name| CPat::Con(name, Vec::new(), Span::DUMMY))
-                .labelled("enum pattern");
-
-            // Parenthesized pattern
-            let paren_pat = pat.clone()
-                .delimited_by(symbol(TokenKind::SymLParen), symbol(TokenKind::SymRParen))
-                .labelled("parenthesized pattern");
-
-            // pConstPattern: numeric or string literal
-            // Haskell CVParser.lhs:2779-2782
-            let const_pat = any().try_map(|token: TokenKind, span| {
-                match token {
-                    TokenKind::Integer { value, size, base } => {
-                        let lit = Literal::Integer(IntLiteral {
-                            value: value.to_string().parse().unwrap_or(0),
-                            width: size.as_ref().and_then(|s| s.to_string().parse().ok()),
-                            base: match base {
-                                2 => IntBase::Binary,
-                                8 => IntBase::Octal,
-                                16 => IntBase::Hexadecimal,
-                                _ => IntBase::Decimal,
-                            },
-                        });
-                        Ok(CPat::Lit(lit, to_position(span)))
-                    }
-                    TokenKind::Number { value, bitwidth, base, .. } => {
-                        use bsc_lexer_bsv::SvNumber;
-                        let int_value: i128 = match value {
-                            SvNumber::Integer(v) => v.to_string().parse().unwrap_or(0),
-                            SvNumber::Real(f) => f as i128,
-                            _ => 0,
-                        };
-                        let lit = Literal::Integer(IntLiteral {
-                            value: int_value,
-                            width: bitwidth.as_ref().and_then(|s| s.to_string().parse().ok()),
-                            base: match base {
-                                Some(bsc_lexer_bsv::SvNumericBase::Bin) => IntBase::Binary,
-                                Some(bsc_lexer_bsv::SvNumericBase::Oct) => IntBase::Octal,
-                                Some(bsc_lexer_bsv::SvNumericBase::Hex) => IntBase::Hexadecimal,
-                                _ => IntBase::Decimal,
-                            },
-                        });
-                        Ok(CPat::Lit(lit, to_position(span)))
-                    }
-                    TokenKind::String(s) => {
-                        let lit = Literal::String(s.to_string());
-                        Ok(CPat::Lit(lit, to_position(span)))
-                    }
-                    _ => Err(Rich::custom(span, "expected constant pattern")),
-                }
+            .map(|((lhs, lt_eq_span), rhs)| {
+                let pos = to_position(lt_eq_span);
+                ImperativeStatement::RegWrite { pos, lhs, rhs }
             })
-            .labelled("constant pattern");
-
-            // Order mirrors Haskell: pattern_variable, tagged, constr, paren, wildcard, const
-            choice((pattern_variable, tagged_pat, paren_pat, wildcard_pat, enum_or_struct_pat, const_pat))
-                .labelled("pattern")
-        });
+            .labelled("register write");
 
         // case (expr) matches tagged Pattern : stmt; ... endcase
         // Mirrors pImperativeCaseMatches from CVParser.lhs
@@ -1926,18 +2235,65 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                         .or_not()
                         .map(|opt| opt.unwrap_or_default())
                 )
-                .then_ignore(semicolon())
-                .map_with(|((ret_type, name), _params), e| {
+                .then(
+                    choice((
+                        semicolon().ignore_then(
+                            choice((
+                                choice((
+                                    keyword(TokenKind::KwFunction),
+                                    keyword(TokenKind::KwModule),
+                                    keyword(TokenKind::KwEndtypeclass),
+                                )).rewind().to(None),
+                                stmt.clone().repeated().collect::<Vec<ImperativeStatement>>()
+                                    .then_ignore(
+                                        keyword(TokenKind::KwEndfunction)
+                                            .then_ignore(
+                                                symbol(TokenKind::SymColon)
+                                                    .ignore_then(word())
+                                                    .or_not()
+                                            )
+                                    )
+                                    .map(Some),
+                            ))
+                        ),
+                        symbol(TokenKind::SymEq)
+                            .ignore_then(expr())
+                            .then_ignore(semicolon())
+                            .map(|e| Some(vec![ImperativeStatement::Return { pos: Position::unknown(), expr: Some(e) }])),
+                    ))
+                )
+                .map_with(|(((ret_type, name), params), body_opt), e| {
+                    let arg_names: Vec<Id> = params.iter()
+                        .map(|(name, _ty)| name.clone())
+                        .collect();
+                    let arg_types: Vec<CType> = params.iter()
+                        .filter_map(|(_name, ty)| ty.clone())
+                        .collect();
+                    let method_type = arg_types.into_iter().rev().fold(ret_type, |acc, arg_ty| {
+                        crate::make_fn_type(arg_ty, acc)
+                    });
+                    let default = match body_opt {
+                        Some(body) => {
+                            let body_expr = convert_stmts_to_expr(body);
+                            vec![CClause {
+                                patterns: params.iter().map(|(id, _)| CPat::Var(id.clone())).collect(),
+                                qualifiers: vec![],
+                                body: body_expr,
+                                span: Span::DUMMY,
+                            }]
+                        }
+                        None => vec![],
+                    };
                     CField {
                         name,
-                        pragmas: None,
+                        pragmas: Some(vec![IfcPragma::ArgNames(arg_names)]),
                         orig_type: None,
                         ty: CQType {
                             context: Vec::new(),
-                            ty: ret_type,
+                            ty: method_type,
                             span: to_span(e.span()),
                         },
-                        default: Vec::new(),
+                        default,
                         span: to_span(e.span()),
                     }
                 }),
@@ -1987,6 +2343,52 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                     .or_not()
                     .map(|opt| opt.unwrap_or_default())
             )
+            .then({
+                let id_or_tuple = word()
+                    .map_with(|name, e| make_id(name, to_position(e.span())))
+                    .map(|id| vec![id])
+                    .or(
+                        symbol(TokenKind::SymLParen)
+                            .ignore_then(
+                                word()
+                                    .map_with(|name, e| make_id(name, to_position(e.span())))
+                                    .separated_by(comma())
+                                    .collect::<Vec<_>>()
+                            )
+                            .then_ignore(symbol(TokenKind::SymRParen))
+                    );
+
+                let dependency = id_or_tuple.clone()
+                    .then_ignore(
+                        any().try_map(|token: TokenKind, span| {
+                            if let TokenKind::Id(name) = &token {
+                                if name == "determines" { return Ok(()); }
+                            }
+                            Err(Rich::custom(span, "expected 'determines'"))
+                        })
+                    )
+                    .then(id_or_tuple)
+                    .map(|(from, to)| (from, to));
+
+                any().try_map(|token: TokenKind, span| {
+                    if let TokenKind::Id(name) = &token {
+                        if name == "dependencies" { return Ok(()); }
+                    }
+                    Err(Rich::custom(span, "expected 'dependencies'"))
+                })
+                .ignore_then(
+                    symbol(TokenKind::SymLParen)
+                        .ignore_then(
+                            dependency
+                                .separated_by(comma())
+                                .at_least(1)
+                                .collect::<Vec<_>>()
+                        )
+                        .then_ignore(symbol(TokenKind::SymRParen))
+                )
+                .or_not()
+                .map(|opt| opt.unwrap_or_default())
+            })
             .then_ignore(semicolon())
             .then(typeclass_member.repeated().collect::<Vec<_>>())
             .then_ignore(
@@ -1997,12 +2399,12 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                             .or_not()
                     )
             )
-            .map_with(|(((name, type_vars), provisos), members), _e| {
+            .map_with(|((((name, type_vars), provisos), fundeps), members), _e| {
                 ImperativeStatement::TypeclassDefn {
                     name,
                     type_vars,
                     provisos,
-                    fundeps: Vec::new(),
+                    fundeps,
                     members,
                 }
             })
@@ -2068,9 +2470,9 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
                 actionvalue_block,
                 while_stmt,
                 var_decl(),
-                typed_var_decl(),
+                typed_var_decl_with_rules,
                 module_inst_old_style(),
-                module_inst_arrow(),
+                module_inst_arrow_with_rules,
                 if_stmt,
                 for_stmt,
                 begin_end,
@@ -2088,28 +2490,40 @@ pub fn parse_imperative_statements<'a>() -> impl Parser<'a, TokenStream<'a>, Imp
     .labelled("imperative statement")
 }
 
-fn attach_attributes_to_stmt(attrs: Vec<SmolStr>, stmt: ImperativeStatement) -> ImperativeStatement {
+fn attr_to_module_pprop(attr_name: &str, attr_value: &Option<String>) -> Option<CPragmaProperty> {
+    let (name, value) = match attr_name {
+        "synthesize" => ("verilog", None),
+        "always_ready" => ("alwaysReady", None),
+        "always_enabled" => ("alwaysEnabled", None),
+        "enabled_when_ready" => ("enabledWhenReady", None),
+        "CLK" | "clock_prefix" => ("CLK", attr_value.clone()),
+        "RSTN" | "RST_N" | "reset_prefix" => ("RSTN", attr_value.clone()),
+        "gate_prefix" => ("GATE", attr_value.clone()),
+        "doc" => ("doc", attr_value.clone()),
+        "no_default_clock" => ("noClock", None),
+        "no_default_reset" => ("noReset", None),
+        "clock_ancestors" => return None,
+        "clock_family" => return None,
+        _ => return None,
+    };
+    Some(CPragmaProperty {
+        name: name.to_string(),
+        value,
+    })
+}
+
+fn attach_attributes_to_stmt(attrs: Vec<(SmolStr, Option<String>)>, stmt: ImperativeStatement) -> ImperativeStatement {
     if attrs.is_empty() {
         return stmt;
     }
 
-    let has_synthesize = attrs.iter().any(|a| a == "synthesize");
-    let has_always_ready = attrs.iter().any(|a| a == "always_ready");
-
     match stmt {
         ImperativeStatement::ModuleDefn { pos, name, module_type, def_clause, .. } => {
             let mut props = Vec::new();
-            if has_synthesize {
-                props.push(CPragmaProperty {
-                    name: "verilog".to_string(),
-                    value: None,
-                });
-            }
-            if has_always_ready {
-                props.push(CPragmaProperty {
-                    name: "alwaysReady".to_string(),
-                    value: None,
-                });
+            for (attr_name, attr_value) in &attrs {
+                if let Some(prop) = attr_to_module_pprop(attr_name, attr_value) {
+                    props.push(prop);
+                }
             }
             let pragma = if !props.is_empty() {
                 Some(CPragma::Properties(name.clone(), props))
@@ -2126,7 +2540,7 @@ fn attach_attributes_to_stmt(attrs: Vec<SmolStr>, stmt: ImperativeStatement) -> 
         }
         ImperativeStatement::FunctionDefn { pos, name, ret_type, params, provisos, body, .. } => {
             let new_attrs: Vec<(Id, Option<CExpr>)> = attrs.iter()
-                .map(|a| (Id::new(a.clone(), pos.clone()), None))
+                .map(|(a, _)| (Id::new(a.clone(), pos.clone()), None))
                 .collect();
             ImperativeStatement::FunctionDefn {
                 pos,
@@ -2138,8 +2552,60 @@ fn attach_attributes_to_stmt(attrs: Vec<SmolStr>, stmt: ImperativeStatement) -> 
                 attrs: new_attrs,
             }
         }
+        ImperativeStatement::Rule { pos, name, guard, body_pos, body, .. } => {
+            let schedule_pragmas = attrs_to_schedule_pragmas(&attrs);
+            let rule_pragmas = attrs_to_rule_pragmas(&attrs);
+            ImperativeStatement::Rule {
+                pos,
+                name,
+                guard,
+                body_pos,
+                body,
+                schedule_pragmas,
+                rule_pragmas,
+            }
+        }
         other => other,
     }
+}
+
+fn attrs_to_schedule_pragmas(attrs: &[(SmolStr, Option<String>)]) -> Vec<CSchedulePragma> {
+    let mut pragmas = Vec::new();
+    for (name, value) in attrs {
+        match name.as_str() {
+            "descending_urgency" => {
+                if let Some(s) = value {
+                    let longnames: Vec<Vec<Id>> = s.split(',')
+                        .map(|part| {
+                            let trimmed = part.trim();
+                            trimmed.split('.')
+                                .map(|seg| Id::new(SmolStr::from(seg.trim()), Position::unknown()))
+                                .collect()
+                        })
+                        .collect();
+                    pragmas.push(CSchedulePragma::Urgency(longnames));
+                }
+            }
+            _ => {}
+        }
+    }
+    pragmas
+}
+
+fn attrs_to_rule_pragmas(attrs: &[(SmolStr, Option<String>)]) -> Vec<bsc_syntax::csyntax::RulePragma> {
+    let mut pragmas = Vec::new();
+    for (name, _value) in attrs {
+        match name.as_str() {
+            "fire_when_enabled" => {
+                pragmas.push(bsc_syntax::csyntax::RulePragma::FireWhenEnabled);
+            }
+            "no_implicit_conditions" => {
+                pragmas.push(bsc_syntax::csyntax::RulePragma::NoImplicitConditions);
+            }
+            _ => {}
+        }
+    }
+    pragmas
 }
 
 /// Create a struct type name for a tagged union constructor with multiple fields.

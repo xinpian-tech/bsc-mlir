@@ -9,3 +9,4 @@ rayon = "1.10"
 rand = "0.8"
 bsc-syntax = { path = "../bsc-syntax" }
 bsc-preprocess = { path = "../bsc-preprocess" }
+similar = "2"

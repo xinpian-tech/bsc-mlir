@@ -212,8 +212,9 @@ pub fn id_equal_at(pos: Position) -> Id {
 }
 
 /// Create inequality operator Id (a != b).
+/// BSV's `!=` maps to Haskell's `/=` (fsNotEqual in PreStrings.hs).
 pub fn id_not_equal_at(pos: Position) -> Id {
-    prelude_id(pos, "!=")
+    prelude_id(pos, "/=")
 }
 
 /// Create bitwise and operator Id (a & b).

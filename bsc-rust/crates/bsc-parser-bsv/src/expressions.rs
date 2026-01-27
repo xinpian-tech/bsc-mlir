@@ -465,12 +465,12 @@ impl<'src> BsvParser<'src> {
     /// Mirrors Haskell's `pPrimaryWithFields :: CExpr -> SV_Parser CExpr`.
     fn parse_primary_with_fields(&mut self, mut expr: CExpr) -> Result<CExpr, ParseError> {
         while self.check(&TokenKind::SymDot) {
+            let dot_pos = self.current().position.clone();
             self.advance(); // consume '.'
 
             match &self.current().kind {
                 TokenKind::Id(field_name) => {
-                    let pos = self.current().position.clone();
-                    let field_id = Id::new(field_name.clone(), pos);
+                    let field_id = Id::new(field_name.clone(), dot_pos);
                     let span = Span::new(expr.span().start, self.current_span().end);
                     self.advance();
 
@@ -1094,7 +1094,7 @@ impl<'src> BsvParser<'src> {
             TokenKind::KwIf => {
                 self.advance(); // consume 'if'
                 self.expect(&TokenKind::SymLParen)?;
-                let cond = self.parse_expr()?;
+                let cond = vec![CQual::Filter(self.parse_expr()?)];
                 self.expect(&TokenKind::SymRParen)?;
 
                 let then_stmt = self.parse_imperative_stmt_core(allow_return, _is_sequence)?;
@@ -1249,11 +1249,12 @@ impl<'src> BsvParser<'src> {
                     },
 
                     TokenKind::SymLtEq => {
+                        let pos = self.current_position();
                         self.advance();
                         let rhs = self.parse_expr()?;
                         self.expect(&TokenKind::SymSemi)?;
 
-                        Ok(ImperativeStatement::RegWrite { lhs: primary, rhs })
+                        Ok(ImperativeStatement::RegWrite { pos, lhs: primary, rhs })
                     },
 
                     TokenKind::SymSemi => {
@@ -1278,10 +1279,11 @@ impl<'src> BsvParser<'src> {
                                 Ok(ImperativeStatement::NakedExpr(expr))
                             },
                             TokenKind::SymLtEq => {
+                                let pos = self.current_position();
                                 self.advance();
                                 let rhs = self.parse_expr()?;
                                 self.expect(&TokenKind::SymSemi)?;
-                                Ok(ImperativeStatement::RegWrite { lhs: expr, rhs })
+                                Ok(ImperativeStatement::RegWrite { pos, lhs: expr, rhs })
                             },
                             TokenKind::SymSemi => {
                                 self.advance();

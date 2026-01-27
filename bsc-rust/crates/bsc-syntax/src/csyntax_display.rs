@@ -600,7 +600,11 @@ impl Display for CExpr {
             CExpr::Lit(lit, pos) => {
                 write!(f, "CLit (CLiteral ")?;
                 fmt_position(f, pos)?;
-                write!(f, " ({}))", HaskellLit(lit))
+                if matches!(lit, Literal::Position) {
+                    write!(f, " {})", HaskellLit(lit))
+                } else {
+                    write!(f, " ({}))", HaskellLit(lit))
+                }
             }
             CExpr::Lambda(pats, body, _) => {
                 fn fmt_nested_lambda(pats: &[CPat], body: &CExpr, f: &mut Formatter<'_>) -> fmt::Result {
@@ -707,8 +711,10 @@ impl Display for CExpr {
             CExpr::Select(e, field, _) => {
                 write!(f, "CSelect ({}) {}", e, field)
             }
-            CExpr::Write { lhs, rhs, .. } => {
-                write!(f, "Cwrite {} {}", lhs, rhs)
+            CExpr::Write { position, lhs, rhs, .. } => {
+                write!(f, "Cwrite ")?;
+                fmt_position(f, position)?;
+                write!(f, " ({}) ({})", lhs, rhs)
             }
             CExpr::Any { position, kind, .. } => {
                 write!(f, "CAny ")?;
@@ -1027,6 +1033,17 @@ impl Display for RulePragma {
 impl Display for CSchedulePragma {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            CSchedulePragma::Urgency(ids) => {
+                write!(f, "SPUrgency ")?;
+                write!(f, "[")?;
+                for (i, longname) in ids.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    fmt_list(f, longname)?;
+                }
+                write!(f, "]")
+            }
             CSchedulePragma::Mutually { exclusive } => {
                 write!(f, "SPMutuallyExclusive ")?;
                 fmt_list(f, exclusive)
@@ -1123,7 +1140,11 @@ impl Display for CPat {
             CPat::Lit(lit, pos) => {
                 write!(f, "CPLit (CLiteral ")?;
                 fmt_position(f, pos)?;
-                write!(f, " ({}))", HaskellLit(lit))
+                if matches!(lit, Literal::Position) {
+                    write!(f, " {})", HaskellLit(lit))
+                } else {
+                    write!(f, " ({}))", HaskellLit(lit))
+                }
             }
             CPat::As(id, pat, _) => {
                 write!(f, "CPAs {} ({})", id, pat)

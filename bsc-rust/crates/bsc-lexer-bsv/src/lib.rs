@@ -905,6 +905,8 @@ impl<'src> Lexer<'src> {
     }
 
     fn lex_tick_or_unbased(&mut self) -> LexResult<TokenKind> {
+        let start = self.pos - 1;
+        let start_pos = self.position();
         self.advance();
 
         match self.peek() {
@@ -930,8 +932,15 @@ impl<'src> Lexer<'src> {
                     'h' => Some(16),
                     _ => None,
                 });
-                if base.is_some() {
-                    Ok(TokenKind::SymTick)
+                if let Some(base) = base {
+                    if signed {
+                        self.advance();
+                    }
+                    self.advance();
+                    while matches!(self.peek(), Some(' ') | Some('\t')) {
+                        self.advance();
+                    }
+                    self.lex_unsized_based_number(base, start, start_pos)
                 } else {
                     Ok(TokenKind::SymTick)
                 }

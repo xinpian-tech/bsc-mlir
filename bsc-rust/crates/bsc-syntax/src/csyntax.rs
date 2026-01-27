@@ -1218,25 +1218,21 @@ pub enum CQual {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CSchedulePragma {
-    /// Rules that should not fire together
+    Urgency(Vec<Vec<Id>>),
     Mutually {
         exclusive: Vec<CExpr>,
     },
-    /// Rules that can fire together
     Conflict {
         rules: Vec<CExpr>,
     },
-    /// Preemption: first rule preempts second
     Preempt {
         first: Vec<CExpr>,
         second: Vec<CExpr>,
     },
-    /// Sequencing: first before second
     Before {
         first: Vec<CExpr>,
         second: Vec<CExpr>,
     },
-    /// Execution order within a clock cycle
     ExecutionOrder(Vec<CExpr>),
 }
 

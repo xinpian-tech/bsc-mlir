@@ -10,6 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use similar::{Algorithm, TextDiff};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxMode {
@@ -56,38 +57,135 @@ struct TestFailure {
     result: FileResult,
 }
 
-fn print_diff_detail(haskell: &str, rust: &str) {
-    eprintln!("\n--- Haskell output (first 500 chars) ---");
-    eprintln!("{}", haskell.chars().take(500).collect::<String>());
-    eprintln!("\n--- Rust output (first 500 chars) ---");
-    eprintln!("{}", rust.chars().take(500).collect::<String>());
-
-    let h_chars: Vec<char> = haskell.chars().collect();
-    let r_chars: Vec<char> = rust.chars().collect();
-
-    for (i, (hc, rc)) in h_chars.iter().zip(r_chars.iter()).enumerate() {
-        if hc != rc {
-            let start = i.saturating_sub(20);
-            let end = (i + 20).min(h_chars.len().min(r_chars.len()));
-            eprintln!("\nFirst diff at position {}:", i);
-            eprintln!(
-                "  Haskell context: ...{}[{}]{}...",
-                h_chars[start..i].iter().collect::<String>(),
-                hc,
-                h_chars.get(i + 1..end).map(|s| s.iter().collect::<String>()).unwrap_or_default()
-            );
-            eprintln!(
-                "  Rust context:    ...{}[{}]{}...",
-                r_chars[start..i].iter().collect::<String>(),
-                rc,
-                r_chars.get(i + 1..end).map(|s| s.iter().collect::<String>()).unwrap_or_default()
-            );
-            break;
+fn tokenize_csyntax(input: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b'(' | b')' | b'[' | b']' | b'{' | b'}' | b',' => {
+                tokens.push(&input[i..i + 1]);
+                i += 1;
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                let start = i;
+                while i < len && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+                    i += 1;
+                }
+                tokens.push(&input[start..i]);
+            }
+            _ => {
+                let start = i;
+                while i < len && !matches!(bytes[i], b'(' | b')' | b'[' | b']' | b'{' | b'}' | b',' | b' ' | b'\t' | b'\n' | b'\r') {
+                    i += 1;
+                }
+                tokens.push(&input[start..i]);
+            }
         }
     }
+    tokens
+}
 
-    if h_chars.len() != r_chars.len() {
-        eprintln!("\nLength difference: Haskell={}, Rust={}", h_chars.len(), r_chars.len());
+fn save_outputs(filename: &str, haskell: &str, rust: &str) {
+    let dir = PathBuf::from("/tmp/bsc-test-diff");
+    let _ = std::fs::create_dir_all(&dir);
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    let h_path = dir.join(format!("{}.haskell.txt", stem));
+    let r_path = dir.join(format!("{}.rust.txt", stem));
+    let _ = std::fs::write(&h_path, haskell);
+    let _ = std::fs::write(&r_path, rust);
+    eprintln!("\nOutputs saved to:");
+    eprintln!("  Haskell: {}", h_path.display());
+    eprintln!("  Rust:    {}", r_path.display());
+}
+
+fn print_diff_detail(filename: &str, haskell: &str, rust: &str) {
+    save_outputs(filename, haskell, rust);
+
+    let h_tokens = tokenize_csyntax(haskell);
+    let r_tokens = tokenize_csyntax(rust);
+
+    let diff = TextDiff::configure()
+        .algorithm(Algorithm::Patience)
+        .diff_slices(&h_tokens, &r_tokens);
+
+    let h_offsets: Vec<usize> = {
+        let mut offsets = Vec::with_capacity(h_tokens.len());
+        let mut pos = 0usize;
+        for t in &h_tokens {
+            offsets.push(pos);
+            pos += t.len();
+        }
+        offsets
+    };
+    let r_offsets: Vec<usize> = {
+        let mut offsets = Vec::with_capacity(r_tokens.len());
+        let mut pos = 0usize;
+        for t in &r_tokens {
+            offsets.push(pos);
+            pos += t.len();
+        }
+        offsets
+    };
+
+    let context_tokens = 30;
+    eprintln!("\n=== Token-level diff (Patience algorithm) ===");
+    eprintln!("Haskell tokens: {}, Rust tokens: {}", h_tokens.len(), r_tokens.len());
+
+    for (idx, group) in diff.grouped_ops(context_tokens).iter().enumerate() {
+        let (h_pos, r_pos) = match group.first() {
+            Some(similar::DiffOp::Equal { old_index, new_index, .. }) => {
+                (h_offsets.get(*old_index).copied().unwrap_or(0),
+                 r_offsets.get(*new_index).copied().unwrap_or(0))
+            }
+            Some(similar::DiffOp::Delete { old_index, new_index, .. }) => {
+                (h_offsets.get(*old_index).copied().unwrap_or(0),
+                 r_offsets.get(*new_index).copied().unwrap_or(0))
+            }
+            Some(similar::DiffOp::Insert { old_index, new_index, .. }) => {
+                (h_offsets.get(*old_index).copied().unwrap_or(0),
+                 r_offsets.get(*new_index).copied().unwrap_or(0))
+            }
+            Some(similar::DiffOp::Replace { old_index, new_index, .. }) => {
+                (h_offsets.get(*old_index).copied().unwrap_or(0),
+                 r_offsets.get(*new_index).copied().unwrap_or(0))
+            }
+            None => (0, 0),
+        };
+        eprintln!("\n--- Hunk {} (haskell byte {}, rust byte {}) ---", idx + 1, h_pos, r_pos);
+        for op in group {
+            match op {
+                similar::DiffOp::Equal { old_index, len, .. } => {
+                    let snippet: String = h_tokens[*old_index..*old_index + *len].concat();
+                    if snippet.len() > 120 {
+                        let chars: Vec<char> = snippet.chars().collect();
+                        let head: String = chars[..60.min(chars.len())].iter().collect();
+                        let tail: String = chars[chars.len().saturating_sub(60)..].iter().collect();
+                        eprintln!("  = {}...{}", head, tail);
+                    } else {
+                        eprintln!("  = {}", snippet);
+                    }
+                }
+                similar::DiffOp::Delete { old_index, old_len, .. } => {
+                    let snippet: String = h_tokens[*old_index..*old_index + *old_len].concat();
+                    eprintln!("  - {}", snippet);
+                }
+                similar::DiffOp::Insert { new_index, new_len, .. } => {
+                    let snippet: String = r_tokens[*new_index..*new_index + *new_len].concat();
+                    eprintln!("  + {}", snippet);
+                }
+                similar::DiffOp::Replace { old_index, old_len, new_index, new_len } => {
+                    let old_snippet: String = h_tokens[*old_index..*old_index + *old_len].concat();
+                    let new_snippet: String = r_tokens[*new_index..*new_index + *new_len].concat();
+                    eprintln!("  - {}", old_snippet);
+                    eprintln!("  + {}", new_snippet);
+                }
+            }
+        }
     }
 }
 
@@ -218,7 +316,10 @@ where
                 panic!("RUST_FAIL: {}", error);
             }
             FileResult::CsyntaxDiff { haskell, rust } => {
-                print_diff_detail(&haskell, &rust);
+                let filename = failure.path.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                print_diff_detail(filename, &haskell, &rust);
                 panic!("CSyntax mismatch");
             }
             FileResult::Timeout => {

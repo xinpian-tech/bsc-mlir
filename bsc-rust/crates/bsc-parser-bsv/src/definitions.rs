@@ -81,7 +81,7 @@ impl<'src> BsvParser<'src> {
     ///
     /// This mirrors `pImperativeModule` from CVParser.lhs.
     pub fn parse_module(&mut self) -> crate::ParseResult<ImperativeStatement> {
-        let start_pos = self.current_span().start;
+        let module_pos = self.current_position();
         self.expect(&TokenKind::KwModule)?;
 
         // Parse optional type parameters: #(param1, param2, ...)
@@ -120,7 +120,7 @@ impl<'src> BsvParser<'src> {
 
         use crate::imperative::build_module_body_expr;
         use smol_str::SmolStr;
-        let pos = Position::new("<unknown>", start_pos as i32, start_pos as i32);
+        let pos = module_pos;
 
         let m_tyvar = CType::Var(Id::new(SmolStr::new_static("_m__"), Position::unknown()));
         let c_tyvar = CType::Var(Id::new(SmolStr::new_static("_c__"), Position::unknown()));
@@ -349,7 +349,7 @@ impl<'src> BsvParser<'src> {
             self.expect(&TokenKind::SymLParen)?;
             let params = self.parse_comma_separated(Self::parse_type_param)?;
             self.expect(&TokenKind::SymRParen)?;
-            params.into_iter().map(|(id, _)| id).collect()
+            params
         } else {
             Vec::new()
         };
@@ -377,10 +377,25 @@ impl<'src> BsvParser<'src> {
 
         let pos = Position::new("<unknown>", start_pos as i32, start_pos as i32);
 
+        let (param_names, kinds): (Vec<Id>, Vec<PartialKind>) = type_vars.into_iter().unzip();
+        let idk = if kinds.is_empty() || kinds.iter().all(|k| matches!(k, PartialKind::PKNoInfo)) {
+            IdK::Plain(name)
+        } else {
+            let cpkinds: Vec<CPartialKind> = kinds.iter().map(|k| match k {
+                PartialKind::PKNum => CPartialKind::Num,
+                PartialKind::PKStr => CPartialKind::Str,
+                PartialKind::PKNoInfo => CPartialKind::NoInfo,
+            }).collect();
+            let pkind = cpkinds.iter().rev().fold(CPartialKind::NoInfo, |acc, k| {
+                CPartialKind::Fun(Box::new(k.clone()), Box::new(acc))
+            });
+            IdK::WithPartialKind(name, pkind)
+        };
+
         Ok(ImperativeStatement::InterfaceDecl {
             pos,
-            name,
-            type_vars,
+            name: idk,
+            type_vars: param_names,
             members,
         })
     }
@@ -752,6 +767,8 @@ impl<'src> BsvParser<'src> {
             guard,
             body_pos,
             body,
+            schedule_pragmas: Vec::new(),
+            rule_pragmas: Vec::new(),
         })
     }
 

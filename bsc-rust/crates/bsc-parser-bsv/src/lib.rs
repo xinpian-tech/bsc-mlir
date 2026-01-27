@@ -270,16 +270,13 @@ impl<'src> BsvParser<'src> {
                 Ok(CDefn::ValueSign(def))
             }
             ImperativeStatement::InterfaceDecl { pos, name, type_vars, members } => {
-                // From Haskell: ISInterface pos name ifcPragmas params methods : rest) =
-                //   do let derivedClasses = []
-                //          defn = Cstruct True (SInterface ifcPragmas) name params methods derivedClasses
                 let struct_def = CStructDef {
-                    visible: true, // Interface constructors are visible
+                    visible: true,
                     sub_type: StructSubType::Interface(vec![]),
-                    name: IdK::Plain(name),
+                    name,
                     params: type_vars,
                     fields: members,
-                    deriving: Vec::new(), // No derived classes for interfaces
+                    deriving: Vec::new(),
                     span: Span::DUMMY,
                 };
 
@@ -301,7 +298,7 @@ impl<'src> BsvParser<'src> {
                     })
                 }
             }
-            ImperativeStatement::Rule { pos, name, guard, body_pos: _, body: _ } => {
+            ImperativeStatement::Rule { pos, name, guard, body_pos: _, body: _, schedule_pragmas: _, rule_pragmas: _ } => {
                 // From Haskell, rules are not directly converted to CDefn in the same way.
                 // They are typically wrapped in a module or handled differently.
                 // For now, we'll create a simple value definition representing the rule

@@ -707,11 +707,10 @@ fn is_constructor_name(name: &str) -> bool {
 /// - `pMkTuple pos []` -> `CPstruct (Just True) idPrimUnit []` (unit type)
 /// - `pMkTuple pos [p]` -> `p` (single element, no tuple)
 /// - `pMkTuple pos (p:ps)` -> `CPCon idComma [p, pMkTuple pos ps]` (nested pairs)
-fn make_tuple_pattern(_pos: Position, patterns: Vec<CPat>) -> CPat {
+fn make_tuple_pattern(pos: Position, patterns: Vec<CPat>) -> CPat {
     match patterns.len() {
         0 => {
-            // Empty tuple -> unit pattern
-            let unit_id = Id::unpositioned("()"); // idPrimUnit equivalent
+            let unit_id = Id::qualified("Prelude", "PrimUnit", pos);
             CPat::Struct(Some(true), unit_id, vec![], bsc_diagnostics::Span::DUMMY)
         },
         1 => {
