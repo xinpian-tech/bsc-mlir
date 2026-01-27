@@ -230,8 +230,10 @@ where
     let passed = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
     let processed = AtomicUsize::new(0);
+    let fail_fast = std::env::var("BSC_TEST_ALL").is_err();
     let failed = AtomicBool::new(false);
     let first_failure: Mutex<Option<TestFailure>> = Mutex::new(None);
+    let all_failures: Mutex<Vec<TestFailure>> = Mutex::new(Vec::new());
 
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -252,7 +254,7 @@ where
     let _ = std::io::stderr().flush();
 
     pool.install(|| all_files.par_iter().for_each(|path| {
-        if failed.load(Ordering::Relaxed) {
+        if fail_fast && failed.load(Ordering::Relaxed) {
             return;
         }
 
@@ -274,26 +276,26 @@ where
             }
             FileResult::Timeout => {
                 let _ = writeln!(std::io::stderr(), "[{}/{}] {} ... TIMEOUT", current, total, filename);
-                if !failed.swap(true, Ordering::Relaxed) {
+                failed.store(true, Ordering::Relaxed);
+                if fail_fast {
                     let mut guard = first_failure.lock().expect("mutex poisoned");
                     if guard.is_none() {
-                        *guard = Some(TestFailure {
-                            path: path.clone(),
-                            result,
-                        });
+                        *guard = Some(TestFailure { path: path.clone(), result });
                     }
+                } else {
+                    all_failures.lock().expect("mutex poisoned").push(TestFailure { path: path.clone(), result });
                 }
             }
             _ => {
                 let _ = writeln!(std::io::stderr(), "[{}/{}] {} ... FAIL", current, total, filename);
-                if !failed.swap(true, Ordering::Relaxed) {
+                failed.store(true, Ordering::Relaxed);
+                if fail_fast {
                     let mut guard = first_failure.lock().expect("mutex poisoned");
                     if guard.is_none() {
-                        *guard = Some(TestFailure {
-                            path: path.clone(),
-                            result,
-                        });
+                        *guard = Some(TestFailure { path: path.clone(), result });
                     }
+                } else {
+                    all_failures.lock().expect("mutex poisoned").push(TestFailure { path: path.clone(), result });
                 }
             }
         }
@@ -302,30 +304,64 @@ where
     let final_passed = passed.load(Ordering::Relaxed);
     let final_skipped = skipped.load(Ordering::Relaxed);
 
-    if let Some(failure) = first_failure.lock().expect("mutex poisoned").take() {
-        let _ = writeln!(std::io::stderr(), "\n=== Test Failed ===");
-        let _ = writeln!(std::io::stderr(), "Progress: passed={}, skipped={}, total={}", final_passed, final_skipped, total);
-        let _ = writeln!(std::io::stderr(), "File: {}", failure.path.display());
-        let _ = std::io::stderr().flush();
+    if fail_fast {
+        if let Some(failure) = first_failure.lock().expect("mutex poisoned").take() {
+            let _ = writeln!(std::io::stderr(), "\n=== Test Failed ===");
+            let _ = writeln!(std::io::stderr(), "Progress: passed={}, skipped={}, total={}", final_passed, final_skipped, total);
+            let _ = writeln!(std::io::stderr(), "File: {}", failure.path.display());
+            let _ = std::io::stderr().flush();
 
-        match failure.result {
-            FileResult::ReadFailed { error } => {
-                panic!("READ_FAIL: {}", error);
+            match failure.result {
+                FileResult::ReadFailed { error } => {
+                    panic!("READ_FAIL: {}", error);
+                }
+                FileResult::RustParseFailed { error } => {
+                    panic!("RUST_FAIL: {}", error);
+                }
+                FileResult::CsyntaxDiff { haskell, rust } => {
+                    let filename = failure.path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown");
+                    print_diff_detail(filename, &haskell, &rust);
+                    panic!("CSyntax mismatch");
+                }
+                FileResult::Timeout => {
+                    panic!("TIMEOUT: parsing took longer than 5 seconds");
+                }
+                _ => unreachable!(),
             }
-            FileResult::RustParseFailed { error } => {
-                panic!("RUST_FAIL: {}", error);
+        }
+    } else {
+        let failures = all_failures.into_inner().expect("mutex poisoned");
+        if !failures.is_empty() {
+            let final_failed = failures.len();
+            let _ = writeln!(std::io::stderr(), "\n=== Test Results ===");
+            let _ = writeln!(std::io::stderr(), "Total: {}, Passed: {}, Failed: {}, Skipped: {}",
+                total, final_passed, final_failed, final_skipped);
+            let _ = writeln!(std::io::stderr(), "\n=== Failed Files ===");
+            for failure in &failures {
+                let label = match &failure.result {
+                    FileResult::RustParseFailed { .. } => "RUST_FAIL",
+                    FileResult::CsyntaxDiff { .. } => "DIFF",
+                    FileResult::ReadFailed { .. } => "READ_FAIL",
+                    FileResult::Timeout => "TIMEOUT",
+                    _ => "UNKNOWN",
+                };
+                let _ = writeln!(std::io::stderr(), "  [{}] {}", label, failure.path.display());
             }
-            FileResult::CsyntaxDiff { haskell, rust } => {
-                let filename = failure.path.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown");
-                print_diff_detail(filename, &haskell, &rust);
-                panic!("CSyntax mismatch");
+            let _ = std::io::stderr().flush();
+
+            for failure in &failures {
+                if let FileResult::CsyntaxDiff { haskell, rust } = &failure.result {
+                    let filename = failure.path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown");
+                    save_outputs(filename, haskell, rust);
+                }
             }
-            FileResult::Timeout => {
-                panic!("TIMEOUT: parsing took longer than 5 seconds");
-            }
-            _ => unreachable!(),
+
+            panic!("{} test(s) failed out of {} (passed={}, skipped={})",
+                final_failed, total, final_passed, final_skipped);
         }
     }
 
@@ -441,6 +477,315 @@ where
     };
 
     let rust_pkg = match parse_fn(&source, &path.to_string_lossy()) {
+        Ok(pkg) => pkg,
+        Err(e) => {
+            return FileResult::RustParseFailed { error: e };
+        }
+    };
+
+    let rust_csyntax = format!("{}", rust_pkg);
+
+    if haskell_csyntax.trim() == rust_csyntax.trim() {
+        FileResult::ExactMatch
+    } else {
+        FileResult::CsyntaxDiff {
+            haskell: haskell_csyntax,
+            rust: rust_csyntax,
+        }
+    }
+}
+
+pub fn run_differential_test_bsv2bsc<F>(
+    source_dir: &Path,
+    bsc_path: &str,
+    parse_fn: F,
+)
+where
+    F: Fn(&str, &str) -> Result<CPackage, String> + Send + Sync + 'static,
+{
+    let parse_fn = Arc::new(parse_fn);
+    let test_file_filter = std::env::var("BSC_TEST_FILE").ok();
+
+    let bsv2bsc_path = Path::new(bsc_path)
+        .parent()
+        .expect("BSC_PATH has no parent directory")
+        .join("bsv2bsc");
+    let bsv2bsc_path = bsv2bsc_path.to_string_lossy().to_string();
+
+    let mut all_files: Vec<_> = walkdir::WalkDir::new(source_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "bsv"))
+        .filter(|e| {
+            test_file_filter.as_ref().map_or(true, |filter| {
+                e.path().to_string_lossy().contains(filter.as_str())
+            })
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    let seed: u64 = std::env::var("BSC_TEST_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    all_files.shuffle(&mut rng);
+
+    let total = all_files.len();
+    let passed = AtomicUsize::new(0);
+    let skipped = AtomicUsize::new(0);
+    let processed = AtomicUsize::new(0);
+    let fail_fast = std::env::var("BSC_TEST_ALL").is_err();
+    let failed = AtomicBool::new(false);
+    let first_failure: Mutex<Option<TestFailure>> = Mutex::new(None);
+    let all_failures: Mutex<Vec<TestFailure>> = Mutex::new(Vec::new());
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .stack_size(64 * 1024 * 1024)
+            .build()
+            .expect("failed to build thread pool")
+    });
+
+    let _ = writeln!(std::io::stderr(), "\n=== BSV-to-Classic Differential Test ===");
+    let _ = writeln!(std::io::stderr(), "Total: {} (using {} threads, seed={})\n", total, num_threads, seed);
+    let _ = writeln!(std::io::stderr(), "To reproduce: BSC_TEST_SEED={}", seed);
+    let _ = std::io::stderr().flush();
+
+    pool.install(|| all_files.par_iter().for_each(|path| {
+        if fail_fast && failed.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
+        let filename = path.file_name().map(|s| s.to_string_lossy()).unwrap_or_default();
+        let _ = writeln!(std::io::stderr(), "[{}/{}] {} ... converting+parsing", current, total, filename);
+        let _ = std::io::stderr().flush();
+
+        let result = test_single_bsv2bsc_with_timeout(
+            path, bsc_path, &bsv2bsc_path, Arc::clone(&parse_fn), Duration::from_secs(10),
+        );
+
+        match &result {
+            FileResult::ExactMatch => {
+                passed.fetch_add(1, Ordering::Relaxed);
+                let _ = writeln!(std::io::stderr(), "[{}/{}] {} ... OK", current, total, filename);
+            }
+            FileResult::HaskellParseFailed => {
+                skipped.fetch_add(1, Ordering::Relaxed);
+                let _ = writeln!(std::io::stderr(), "[{}/{}] {} ... SKIP", current, total, filename);
+            }
+            FileResult::Timeout => {
+                let _ = writeln!(std::io::stderr(), "[{}/{}] {} ... TIMEOUT", current, total, filename);
+                failed.store(true, Ordering::Relaxed);
+                if fail_fast {
+                    let mut guard = first_failure.lock().expect("mutex poisoned");
+                    if guard.is_none() {
+                        *guard = Some(TestFailure { path: path.clone(), result });
+                    }
+                } else {
+                    all_failures.lock().expect("mutex poisoned").push(TestFailure { path: path.clone(), result });
+                }
+            }
+            _ => {
+                let _ = writeln!(std::io::stderr(), "[{}/{}] {} ... FAIL", current, total, filename);
+                failed.store(true, Ordering::Relaxed);
+                if fail_fast {
+                    let mut guard = first_failure.lock().expect("mutex poisoned");
+                    if guard.is_none() {
+                        *guard = Some(TestFailure { path: path.clone(), result });
+                    }
+                } else {
+                    all_failures.lock().expect("mutex poisoned").push(TestFailure { path: path.clone(), result });
+                }
+            }
+        }
+    }));
+
+    let final_passed = passed.load(Ordering::Relaxed);
+    let final_skipped = skipped.load(Ordering::Relaxed);
+
+    if fail_fast {
+        if let Some(failure) = first_failure.lock().expect("mutex poisoned").take() {
+            let _ = writeln!(std::io::stderr(), "\n=== Test Failed ===");
+            let _ = writeln!(std::io::stderr(), "Progress: passed={}, skipped={}, total={}", final_passed, final_skipped, total);
+            let _ = writeln!(std::io::stderr(), "File: {}", failure.path.display());
+            let _ = std::io::stderr().flush();
+
+            match failure.result {
+                FileResult::ReadFailed { error } => {
+                    panic!("READ_FAIL: {}", error);
+                }
+                FileResult::RustParseFailed { error } => {
+                    panic!("RUST_FAIL: {}", error);
+                }
+                FileResult::CsyntaxDiff { haskell, rust } => {
+                    let filename = failure.path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown");
+                    print_diff_detail(filename, &haskell, &rust);
+                    panic!("CSyntax mismatch");
+                }
+                FileResult::Timeout => {
+                    panic!("TIMEOUT: bsv2bsc conversion + parsing took longer than 10 seconds");
+                }
+                _ => unreachable!(),
+            }
+        }
+    } else {
+        let failures = all_failures.into_inner().expect("mutex poisoned");
+        if !failures.is_empty() {
+            let final_failed = failures.len();
+            let _ = writeln!(std::io::stderr(), "\n=== Test Results ===");
+            let _ = writeln!(std::io::stderr(), "Total: {}, Passed: {}, Failed: {}, Skipped: {}",
+                total, final_passed, final_failed, final_skipped);
+            let _ = writeln!(std::io::stderr(), "\n=== Failed Files ===");
+            for failure in &failures {
+                let label = match &failure.result {
+                    FileResult::RustParseFailed { .. } => "RUST_FAIL",
+                    FileResult::CsyntaxDiff { .. } => "DIFF",
+                    FileResult::ReadFailed { .. } => "READ_FAIL",
+                    FileResult::Timeout => "TIMEOUT",
+                    _ => "UNKNOWN",
+                };
+                let _ = writeln!(std::io::stderr(), "  [{}] {}", label, failure.path.display());
+            }
+            let _ = std::io::stderr().flush();
+
+            for failure in &failures {
+                if let FileResult::CsyntaxDiff { haskell, rust } = &failure.result {
+                    let filename = failure.path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown");
+                    save_outputs(filename, haskell, rust);
+                }
+            }
+
+            panic!("{} test(s) failed out of {} (passed={}, skipped={})",
+                final_failed, total, final_passed, final_skipped);
+        }
+    }
+
+    eprintln!("\n=== All Tests Passed ===");
+    eprintln!("Total: {}, Passed: {}, Skipped: {}", total, final_passed, final_skipped);
+}
+
+fn test_single_bsv2bsc_with_timeout<F>(
+    path: &Path,
+    bsc_path: &str,
+    bsv2bsc_path: &str,
+    parse_fn: Arc<F>,
+    timeout: Duration,
+) -> FileResult
+where
+    F: Fn(&str, &str) -> Result<CPackage, String> + Send + Sync + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    let path = path.to_path_buf();
+    let bsc_path = bsc_path.to_string();
+    let bsv2bsc_path = bsv2bsc_path.to_string();
+
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let result = test_single_bsv2bsc_inner(&path, &bsc_path, &bsv2bsc_path, &*parse_fn);
+            let _ = tx.send(result);
+        })
+        .expect("Failed to spawn test thread");
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => FileResult::Timeout,
+        Err(mpsc::RecvTimeoutError::Disconnected) => FileResult::RustParseFailed {
+            error: "Test thread panicked".to_string(),
+        },
+    }
+}
+
+fn test_single_bsv2bsc_inner<F>(
+    path: &Path,
+    bsc_path: &str,
+    bsv2bsc_path: &str,
+    parse_fn: &F,
+) -> FileResult
+where
+    F: Fn(&str, &str) -> Result<CPackage, String>,
+{
+    if !path.exists() {
+        return FileResult::ReadFailed {
+            error: format!("File not found: {}", path.display()),
+        };
+    }
+
+    let convert_output = Command::new(bsv2bsc_path).arg(path).output();
+    let classic_source = match convert_output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            if !out.status.success() || stdout.trim().is_empty() {
+                return FileResult::HaskellParseFailed;
+            }
+            stdout
+        }
+        Err(_) => {
+            return FileResult::HaskellParseFailed;
+        }
+    };
+
+    let temp_dir = std::env::temp_dir()
+        .join("bsc-test-bsv2bsc")
+        .join(format!("thread-{:?}", std::thread::current().id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("converted");
+    let temp_bs = temp_dir.join(format!("{}.bs", stem));
+    if std::fs::write(&temp_bs, &classic_source).is_err() {
+        return FileResult::ReadFailed {
+            error: format!("Failed to write temp file: {}", temp_bs.display()),
+        };
+    }
+
+    let mut cmd = Command::new(bsc_path);
+    cmd.arg("-show-csyntax")
+        .arg("-bdir").arg(&temp_dir)
+        .arg(&temp_bs);
+
+    let haskell_output = cmd.output();
+
+    for entry in std::fs::read_dir(&temp_dir).into_iter().flatten() {
+        if let Ok(e) = entry {
+            if e.path().extension().map_or(false, |ext| ext == "bo") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
+    let haskell_csyntax = match haskell_output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            if stdout.starts_with("CPackage ") {
+                stdout
+            } else {
+                return FileResult::HaskellParseFailed;
+            }
+        }
+        Err(_) => {
+            return FileResult::HaskellParseFailed;
+        }
+    };
+
+    let rust_pkg = match parse_fn(&classic_source, &temp_bs.to_string_lossy()) {
         Ok(pkg) => pkg,
         Err(e) => {
             return FileResult::RustParseFailed { error: e };

@@ -3688,7 +3688,7 @@ pub fn parse_pattern(source: &str) -> ParseResult<CPat> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bsc_test_utils::{get_bsc_path, get_libraries_dir, run_differential_test_fail_fast, SyntaxMode};
+    use bsc_test_utils::{get_bsc_path, get_libraries_dir, get_testsuite_dir, run_differential_test_fail_fast, run_differential_test_bsv2bsc, SyntaxMode};
 
     #[test]
     fn test_differential_all_libraries() {
@@ -3711,6 +3711,32 @@ mod tests {
         run_differential_test_fail_fast(
             SyntaxMode::Classic,
             &libraries_dir,
+            &bsc_path,
+            |source, filename| {
+                parse_package_with_file(source, filename)
+                    .map_err(|errs| format!("{:?}", errs.first()))
+            },
+        );
+    }
+
+    #[test]
+    fn test_differential_bsv2bsc() {
+        let bsc_path = match get_bsc_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("BSC_PATH not set, skipping bsv2bsc differential test");
+                return;
+            }
+        };
+
+        let testsuite_dir = get_testsuite_dir();
+        if !testsuite_dir.exists() {
+            eprintln!("BSC_TESTSUITE_DIR not found at {}, skipping bsv2bsc differential test", testsuite_dir.display());
+            return;
+        }
+
+        run_differential_test_bsv2bsc(
+            &testsuite_dir,
             &bsc_path,
             |source, filename| {
                 parse_package_with_file(source, filename)
